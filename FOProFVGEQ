@@ -1,0 +1,1045 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+// Moved outside the namespace to permanently fix the NT8 Code Generator bug
+public enum OpExtensionMode
+{
+    UntilMitigated,
+    UntilEOD,
+    Unlimited
+}
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class GapBox
+    {
+        public DateTime BirthTime;
+        public DateTime DeathTime = DateTime.MaxValue; 
+        public bool IsMitigated = false;
+        public double Top;
+        public double Bot;
+        public double Size;
+        public int SessionID;
+    }
+
+    public class KzBox
+    {
+        public DateTime StartTime;
+        public DateTime EndTime;
+        public double High = double.MinValue;
+        public double Low = double.MaxValue;
+        public bool IsActive = true;
+        
+        public bool HighActive = true;
+        public DateTime HighEnd;
+        
+        public bool LowActive = true;
+        public DateTime LowEnd;
+        
+        public Brush BoxColor;
+        public string CodePrefix;
+        public bool DrawBox;
+        public int SessionID;
+    }
+
+    public class OpenLine
+    {
+        public DateTime StartTime;
+        public DateTime EndTime = DateTime.MaxValue;
+        public double Price;
+        public string Label;
+        public Brush LineColor;
+        public int SessionID;
+    }
+
+    public class FOProFVGEQ : Indicator
+    {
+        // FVG Tracking
+        private List<GapBox> bullBoxes = new List<GapBox>();
+        private List<GapBox> bearBoxes = new List<GapBox>();
+        private List<GapBox> bullIfvgBoxes = new List<GapBox>();
+        private List<GapBox> bearIfvgBoxes = new List<GapBox>();
+
+        // Killzone Tracking
+        private List<KzBox> killzones = new List<KzBox>();
+        private KzBox activeAsia, activeLondon, activeNyAm, activeNyLunch, activeNyPm;
+
+        // Opening Prices Tracking
+        private List<OpenLine> openLinesList = new List<OpenLine>();
+        private DateTime op1LastDate, op2LastDate, op3LastDate, op4LastDate, op5LastDate, op6LastDate, op7LastDate, op8LastDate;
+
+        // Daily EQ Tracking
+        private double dayHigh = double.MinValue;
+        private double dayLow = double.MaxValue;
+        private DateTime dayStart = DateTime.MinValue;
+
+        // Session ID Engine
+        private int sessionCounter = 0;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "TFO Pro FVGs, Killzones, Opening Lines, and Daily Equilibrium";
+                Name = "FOProFVGEQ";
+                Calculate = Calculate.OnPriceChange;
+                IsOverlay = true;
+                DisplayInDataBox = false;
+                PaintPriceMarkers = false;
+
+                // 1. Master Toggles
+                EnableFVGs = true;
+                EnableEQ = true;
+                EnableKillzones = true;
+
+                // 2. FVG Settings
+                SizeUnitIsTicks = true; 
+                MinSize = 1.0;
+                MaxSize = 5000.0;
+
+                // 3. FVG Visuals & Cleanup
+                FixedFvgMargin = 15;
+                FixedIfvgMargin = 30;
+                MaxFvgAgeHours = 24.0;
+                MaxIfvgAgeHours = 24.0;
+                DeleteMitigated = false; 
+                ShowInversions = false;
+                FilterNyOpen = true;
+
+                BullColor = Brushes.CadetBlue; 
+                BearColor = Brushes.Gray;
+                BullIfvgCol = Brushes.SteelBlue;
+                BearIfvgCol = Brushes.SlateGray;
+                FvgOpacity = 20;
+
+                // 4. Daily Equilibrium
+                EqColor = Brushes.Orange;
+                EqWidth = 2;
+                EqStyle = DashStyleHelper.Dot;
+                EqTextColor = Brushes.Orange;
+                EqTextSize = 10;
+                EqRightMargin = 15;
+
+                // 5. Killzone Toggles
+                ShowKzPivots = true;
+                ShowKzLabels = true;
+                
+                UseAsia = true; DrawAsiaBox = true;
+                UseLondon = true; DrawLondonBox = true;
+                UseNyAm = true; DrawNyAmBox = false; 
+                UseNyLunch = false; DrawNyLunchBox = false;
+                UseNyPm = true; DrawNyPmBox = true;
+
+                // 6. Killzone Times
+                AsiaStart = DateTime.Parse("20:00:00"); AsiaEnd = DateTime.Parse("00:00:00");
+                LondonStart = DateTime.Parse("02:00:00"); LondonEnd = DateTime.Parse("05:00:00");
+                NyAmStart = DateTime.Parse("09:30:00"); NyAmEnd = DateTime.Parse("11:00:00");
+                NyLunchStart = DateTime.Parse("12:00:00"); NyLunchEnd = DateTime.Parse("13:00:00");
+                NyPmStart = DateTime.Parse("13:30:00"); NyPmEnd = DateTime.Parse("16:00:00");
+                NyFilterStart = DateTime.Parse("09:30:00"); NyFilterEnd = DateTime.Parse("09:35:00");
+
+                // 7. Killzone Visuals
+                AsiaColor = Brushes.MediumTurquoise;
+                LondonColor = Brushes.Plum;
+                NyAmColor = Brushes.SlateBlue;
+                NyLunchColor = Brushes.Yellow;
+                NyPmColor = Brushes.MediumPurple;
+                KzOpacity = 10;
+                KzDaysToKeep = 3;
+                KzTextColor = Brushes.White;
+                KzTextSize = 10;
+                KzRightMargin = 15;
+
+                // 8. Opening Prices
+                OpExtMode = OpExtensionMode.UntilEOD;
+                OpTextAlign = TextAlignment.Right;
+                OpTextSize = 10;
+                OpTextColor = Brushes.White;
+                OpStyle = DashStyleHelper.Dash;
+                OpWidth = 1;
+                OpRightMargin = 15;
+
+                Op1Use = true; Op1Label = "True Day Open"; Op1Time = DateTime.Parse("00:00:00"); Op1Color = Brushes.MediumVioletRed;
+                Op2Use = true; Op2Label = "8:30 open"; Op2Time = DateTime.Parse("08:30:00"); Op2Color = Brushes.MediumVioletRed;
+                Op3Use = true; Op3Label = "10:00"; Op3Time = DateTime.Parse("10:00:00"); Op3Color = Brushes.MediumVioletRed;
+                Op4Use = false; Op4Label = "14:00"; Op4Time = DateTime.Parse("14:00:00"); Op4Color = Brushes.SlateBlue;
+                Op5Use = false; Op5Label = "00:00"; Op5Time = DateTime.Parse("00:00:00"); Op5Color = Brushes.SlateBlue;
+                Op6Use = false; Op6Label = "00:00"; Op6Time = DateTime.Parse("00:00:00"); Op6Color = Brushes.SlateBlue;
+                Op7Use = false; Op7Label = "00:00"; Op7Time = DateTime.Parse("00:00:00"); Op7Color = Brushes.SlateBlue;
+                Op8Use = false; Op8Label = "00:00"; Op8Time = DateTime.Parse("00:00:00"); Op8Color = Brushes.SlateBlue;
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < 5) return; 
+
+            if (IsFirstTickOfBar)
+            {
+                if (Bars.IsFirstBarOfSession)
+                {
+                    sessionCounter++; 
+                }
+            }
+
+            TimeSpan tvTimeOfDay = Time[1].TimeOfDay; 
+
+            // --- 1. DAILY EQUILIBRIUM ---
+            if (EnableEQ)
+            {
+                if (Bars.IsFirstBarOfSession)
+                {
+                    dayHigh = High[0];
+                    dayLow = Low[0];
+                    dayStart = Time[0];
+                }
+                else
+                {
+                    dayHigh = Math.Max(dayHigh, High[0]);
+                    dayLow = Math.Min(dayLow, Low[0]);
+                }
+            }
+
+            // --- 2. KILLZONE ENGINE ---
+            if (EnableKillzones)
+            {
+                if (UseAsia) UpdateKillzone(ref activeAsia, "AS", AsiaStart.TimeOfDay, AsiaEnd.TimeOfDay, tvTimeOfDay, AsiaColor, DrawAsiaBox);
+                if (UseLondon) UpdateKillzone(ref activeLondon, "LO", LondonStart.TimeOfDay, LondonEnd.TimeOfDay, tvTimeOfDay, LondonColor, DrawLondonBox);
+                if (UseNyAm) UpdateKillzone(ref activeNyAm, "NYAM", NyAmStart.TimeOfDay, NyAmEnd.TimeOfDay, tvTimeOfDay, NyAmColor, DrawNyAmBox);
+                if (UseNyLunch) UpdateKillzone(ref activeNyLunch, "NYL", NyLunchStart.TimeOfDay, NyLunchEnd.TimeOfDay, tvTimeOfDay, NyLunchColor, DrawNyLunchBox);
+                if (UseNyPm) UpdateKillzone(ref activeNyPm, "NYPM", NyPmStart.TimeOfDay, NyPmEnd.TimeOfDay, tvTimeOfDay, NyPmColor, DrawNyPmBox);
+            }
+
+            if (IsFirstTickOfBar)
+            {
+                // --- 3. OPENING PRICES EVALUATION & MITIGATION ---
+                CheckOpenPrice(ref op1LastDate, Op1Use, Op1Time.TimeOfDay, Op1Label, Op1Color);
+                CheckOpenPrice(ref op2LastDate, Op2Use, Op2Time.TimeOfDay, Op2Label, Op2Color);
+                CheckOpenPrice(ref op3LastDate, Op3Use, Op3Time.TimeOfDay, Op3Label, Op3Color);
+                CheckOpenPrice(ref op4LastDate, Op4Use, Op4Time.TimeOfDay, Op4Label, Op4Color);
+                CheckOpenPrice(ref op5LastDate, Op5Use, Op5Time.TimeOfDay, Op5Label, Op5Color);
+                CheckOpenPrice(ref op6LastDate, Op6Use, Op6Time.TimeOfDay, Op6Label, Op6Color);
+                CheckOpenPrice(ref op7LastDate, Op7Use, Op7Time.TimeOfDay, Op7Label, Op7Color);
+                CheckOpenPrice(ref op8LastDate, Op8Use, Op8Time.TimeOfDay, Op8Label, Op8Color);
+
+                foreach (var op in openLinesList)
+                {
+                    if (op.EndTime != DateTime.MaxValue) continue; 
+
+                    if (OpExtMode == OpExtensionMode.UntilMitigated)
+                    {
+                        if (op.StartTime != Time[1] && High[1] >= op.Price && Low[1] <= op.Price)
+                        {
+                            op.EndTime = Time[1];
+                        }
+                    }
+                    else if (OpExtMode == OpExtensionMode.UntilEOD)
+                    {
+                        if (sessionCounter > op.SessionID)
+                        {
+                            op.EndTime = Time[1]; 
+                        }
+                    }
+                }
+
+                // --- 4. KILLZONE MITIGATIONS ---
+                if (EnableKillzones && ShowKzPivots)
+                {
+                    foreach (var kz in killzones)
+                    {
+                        if (!kz.IsActive)
+                        {
+                            if (kz.HighActive && High[1] > kz.High) { kz.HighActive = false; kz.HighEnd = Time[1]; }
+                            else if (kz.HighActive) kz.HighEnd = Time[0];
+
+                            if (kz.LowActive && Low[1] < kz.Low) { kz.LowActive = false; kz.LowEnd = Time[1]; }
+                            else if (kz.LowActive) kz.LowEnd = Time[0];
+                        }
+                    }
+                }
+
+                if (!EnableFVGs) return;
+
+                TimeSpan maxFvgAge = TimeSpan.FromHours(MaxFvgAgeHours);
+                TimeSpan maxIfvgAge = TimeSpan.FromHours(MaxIfvgAgeHours);
+
+                // --- 5. FVG MITIGATIONS ---
+                for (int i = bullBoxes.Count - 1; i >= 0; i--)
+                {
+                    var gb = bullBoxes[i];
+                    if (gb.IsMitigated) continue;
+                    if (Time[1] - gb.BirthTime > maxFvgAge) { bullBoxes.RemoveAt(i); continue; }
+
+                    if (Close[1] < gb.Bot) 
+                    {
+                        gb.IsMitigated = true; gb.DeathTime = Time[1]; 
+                        if (ShowInversions) bearIfvgBoxes.Add(new GapBox { BirthTime = gb.BirthTime, Top = gb.Top, Bot = gb.Bot, Size = gb.Size });
+                        if (DeleteMitigated) bullBoxes.RemoveAt(i);
+                    }
+                }
+
+                for (int i = bearBoxes.Count - 1; i >= 0; i--)
+                {
+                    var gb = bearBoxes[i];
+                    if (gb.IsMitigated) continue;
+                    if (Time[1] - gb.BirthTime > maxFvgAge) { bearBoxes.RemoveAt(i); continue; }
+
+                    if (Close[1] > gb.Top) 
+                    {
+                        gb.IsMitigated = true; gb.DeathTime = Time[1];
+                        if (ShowInversions) bullIfvgBoxes.Add(new GapBox { BirthTime = gb.BirthTime, Top = gb.Top, Bot = gb.Bot, Size = gb.Size });
+                        if (DeleteMitigated) bearBoxes.RemoveAt(i);
+                    }
+                }
+
+                for (int i = bullIfvgBoxes.Count - 1; i >= 0; i--)
+                {
+                    var gb = bullIfvgBoxes[i];
+                    if (gb.IsMitigated) continue;
+                    if (Time[1] - gb.BirthTime > maxIfvgAge) { bullIfvgBoxes.RemoveAt(i); continue; }
+                    if (Close[1] < gb.Bot) { gb.IsMitigated = true; gb.DeathTime = Time[1]; if (DeleteMitigated) bullIfvgBoxes.RemoveAt(i); }
+                }
+
+                for (int i = bearIfvgBoxes.Count - 1; i >= 0; i--)
+                {
+                    var gb = bearIfvgBoxes[i];
+                    if (gb.IsMitigated) continue;
+                    if (Time[1] - gb.BirthTime > maxIfvgAge) { bearIfvgBoxes.RemoveAt(i); continue; }
+                    if (Close[1] > gb.Top) { gb.IsMitigated = true; gb.DeathTime = Time[1]; if (DeleteMitigated) bearIfvgBoxes.RemoveAt(i); }
+                }
+
+                // --- 6. FVG CREATION ---
+                bool isBullFvg = Low[1] > High[3];
+                bool isBearFvg = High[1] < Low[3];
+
+                if (isBullFvg && AllowFvg())
+                {
+                    double top = Low[1]; double bot = High[3];
+                    double size = CalculateSize(top, bot);
+                    if (size >= MinSize && size <= MaxSize) bullBoxes.Add(new GapBox { BirthTime = Time[3], Top = top, Bot = bot, Size = size, SessionID = sessionCounter });
+                }
+
+                if (isBearFvg && AllowFvg())
+                {
+                    double top = Low[3]; double bot = High[1];
+                    double size = CalculateSize(top, bot);
+                    if (size >= MinSize && size <= MaxSize) bearBoxes.Add(new GapBox { BirthTime = Time[3], Top = top, Bot = bot, Size = size, SessionID = sessionCounter });
+                }
+
+                if (bullBoxes.Count > 200) bullBoxes.RemoveAt(0);
+                if (bearBoxes.Count > 200) bearBoxes.RemoveAt(0);
+                if (bullIfvgBoxes.Count > 200) bullIfvgBoxes.RemoveAt(0);
+                if (bearIfvgBoxes.Count > 200) bearIfvgBoxes.RemoveAt(0);
+            }
+        }
+
+        private void CheckOpenPrice(ref DateTime lastDate, bool use, TimeSpan target, string label, Brush color)
+        {
+            if (!use) return;
+
+            DateTime todayDate = Time[1].Date;
+            if (lastDate == todayDate) return;
+
+            TimeSpan t1 = Time[1].TimeOfDay;
+            TimeSpan t0 = Time[0].TimeOfDay;
+
+            bool triggered = false;
+            if (t1 <= target && t0 > target) triggered = true;
+            else if (t1 > t0) 
+            {
+                if (target >= t1 || target < t0) triggered = true;
+            }
+
+            if (triggered)
+            {
+                lastDate = todayDate;
+                openLinesList.Add(new OpenLine { StartTime = Time[1], Price = Open[0], Label = label, LineColor = color, SessionID = sessionCounter });
+                
+                // --- STRICT INSERTION TRIMMER FOR OPENING PRICES ---
+                var specificLines = openLinesList.Where(x => x.Label == label).ToList();
+                while (specificLines.Count > KzDaysToKeep)
+                {
+                    openLinesList.Remove(specificLines[0]);
+                    specificLines.RemoveAt(0);
+                }
+            }
+        }
+
+        private void UpdateKillzone(ref KzBox kz, string prefix, TimeSpan start, TimeSpan end, TimeSpan currentTod, Brush color, bool drawBox)
+        {
+            bool inSession = false;
+            if (start <= end) inSession = currentTod >= start && currentTod < end;
+            else inSession = currentTod >= start || currentTod < end; 
+
+            if (inSession)
+            {
+                if (kz == null)
+                {
+                    kz = new KzBox { 
+                        StartTime = Time[1], EndTime = Time[0], High = High[0], Low = Low[0], 
+                        BoxColor = color, CodePrefix = prefix, DrawBox = drawBox, SessionID = sessionCounter
+                    };
+                    killzones.Add(kz);
+
+                    // --- STRICT INSERTION TRIMMER FOR KILLZONES ---
+                    var specificZones = killzones.Where(x => x.CodePrefix == prefix).ToList();
+                    while (specificZones.Count > KzDaysToKeep)
+                    {
+                        killzones.Remove(specificZones[0]);
+                        specificZones.RemoveAt(0);
+                    }
+                }
+                else
+                {
+                    kz.EndTime = Time[0];
+                    kz.High = Math.Max(kz.High, High[0]);
+                    kz.Low = Math.Min(kz.Low, Low[0]);
+                    kz.HighEnd = Time[0];
+                    kz.LowEnd = Time[0];
+                    kz.DrawBox = drawBox;
+                }
+            }
+            else if (kz != null)
+            {
+                kz.IsActive = false;
+                kz = null;
+            }
+        }
+
+        private double CalculateSize(double top, double bot)
+        {
+            double diff = Math.Abs(top - bot);
+            return SizeUnitIsTicks ? (diff / TickSize) : diff;
+        }
+
+        private bool AllowFvg()
+        {
+            if (!FilterNyOpen) return true;
+            bool IsNyFakeout(int n)
+            {
+                TimeSpan openTod = Time[n + 1].TimeOfDay;
+                return openTod >= NyFilterStart.TimeOfDay && openTod < NyFilterEnd.TimeOfDay;
+            }
+            return !(IsNyFakeout(1) || IsNyFakeout(2) || IsNyFakeout(3));
+        }
+
+        protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
+        {
+            base.OnRender(chartControl, chartScale);
+
+            if (Bars == null || ChartPanel == null) return;
+            DateTime lastTime = Bars.GetTime(Bars.Count - 1);
+
+            // --- RENDER OPENING PRICES ---
+            var scbOpTxt = OpTextColor as SolidColorBrush;
+            if (scbOpTxt != null)
+            {
+                using (var lblFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial", SharpDX.DirectWrite.FontWeight.Bold, SharpDX.DirectWrite.FontStyle.Normal, OpTextSize))
+                using (var strokeStyleOp = new SharpDX.Direct2D1.StrokeStyle(RenderTarget.Factory, new SharpDX.Direct2D1.StrokeStyleProperties { DashStyle = GetDXDash(OpStyle) }))
+                using (var dxOpTxt = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbOpTxt.Color.R, (int)scbOpTxt.Color.G, (int)scbOpTxt.Color.B, 255)))
+                {
+                    foreach (var op in openLinesList)
+                    {
+                        var scbOp = op.LineColor as SolidColorBrush;
+                        if (scbOp == null) continue;
+
+                        using (var dxOp = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbOp.Color.R, (int)scbOp.Color.G, (int)scbOp.Color.B, 255)))
+                        {
+                            float startX = chartControl.GetXByTime(op.StartTime);
+                            float endX = op.EndTime != DateTime.MaxValue 
+                                ? chartControl.GetXByTime(op.EndTime) 
+                                : chartControl.GetXByTime(lastTime) + (OpRightMargin * chartControl.Properties.BarDistance);
+                                
+                            float y = chartScale.GetYByValue(op.Price);
+
+                            RenderTarget.DrawLine(new SharpDX.Vector2(startX, y), new SharpDX.Vector2(endX, y), dxOp, OpWidth, strokeStyleOp);
+
+                            float rectWidth = 400;
+                            float rectX = startX + 5;
+
+                            if (OpTextAlign == TextAlignment.Right) {
+                                rectX = endX - rectWidth;
+                                lblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Trailing;
+                            } else if (OpTextAlign == TextAlignment.Center) {
+                                rectX = startX;
+                                rectWidth = endX - startX;
+                                lblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Center;
+                            } else {
+                                lblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Leading;
+                            }
+
+                            var textRect = new SharpDX.RectangleF(rectX, y - OpTextSize - 4, rectWidth, OpTextSize + 5);
+                            RenderTarget.DrawText(op.Label, lblFormat, textRect, dxOpTxt);
+                        }
+                    }
+                }
+            }
+
+            // --- RENDER KILLZONES ---
+            if (EnableKillzones)
+            {
+                var scbKzTxt = KzTextColor as SolidColorBrush;
+                if (scbKzTxt != null)
+                {
+                    using (var strokeStyleSolid = new SharpDX.Direct2D1.StrokeStyle(RenderTarget.Factory, new SharpDX.Direct2D1.StrokeStyleProperties { DashStyle = SharpDX.Direct2D1.DashStyle.Solid }))
+                    using (var lblFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial", SharpDX.DirectWrite.FontWeight.Bold, SharpDX.DirectWrite.FontStyle.Normal, KzTextSize))
+                    using (var dxKzTxt = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbKzTxt.Color.R, (int)scbKzTxt.Color.G, (int)scbKzTxt.Color.B, 255)))
+                    {
+                        lblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Trailing; 
+
+                        foreach (var kz in killzones)
+                        {
+                            var scbKz = kz.BoxColor as SolidColorBrush;
+                            if (scbKz == null) continue;
+
+                            using (var dxKzBox = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbKz.Color.R, (int)scbKz.Color.G, (int)scbKz.Color.B, (int)(KzOpacity * 2.55f))))
+                            using (var dxKzPivot = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbKz.Color.R, (int)scbKz.Color.G, (int)scbKz.Color.B, 255)))
+                            {
+                                float startX = chartControl.GetXByTime(kz.StartTime);
+                                float boxEndX = chartControl.GetXByTime(kz.IsActive ? lastTime : kz.EndTime);
+                                float topY = chartScale.GetYByValue(kz.High);
+                                float botY = chartScale.GetYByValue(kz.Low);
+
+                                if (kz.DrawBox)
+                                {
+                                    var rect = new SharpDX.RectangleF(startX, Math.Min(topY, botY), Math.Max(1, boxEndX - startX), Math.Abs(topY - botY));
+                                    RenderTarget.FillRectangle(rect, dxKzBox);
+                                }
+
+                                if (ShowKzPivots && !kz.IsActive)
+                                {
+                                    float pivotStartX = boxEndX; 
+                                    
+                                    float pHighEndX = kz.HighActive 
+                                        ? chartControl.GetXByTime(lastTime) + (KzRightMargin * chartControl.Properties.BarDistance)
+                                        : chartControl.GetXByTime(kz.HighEnd);
+                                        
+                                    RenderTarget.DrawLine(new SharpDX.Vector2(pivotStartX, topY), new SharpDX.Vector2(pHighEndX, topY), dxKzPivot, 1, strokeStyleSolid);
+
+                                    if (ShowKzLabels)
+                                    {
+                                        var hiRect = new SharpDX.RectangleF(pHighEndX - 80, topY - KzTextSize - 3, 80, KzTextSize + 2);
+                                        RenderTarget.DrawText($"{kz.CodePrefix}.H", lblFormat, hiRect, dxKzTxt);
+                                    }
+
+                                    float pLowEndX = kz.LowActive 
+                                        ? chartControl.GetXByTime(lastTime) + (KzRightMargin * chartControl.Properties.BarDistance)
+                                        : chartControl.GetXByTime(kz.LowEnd);
+                                        
+                                    RenderTarget.DrawLine(new SharpDX.Vector2(pivotStartX, botY), new SharpDX.Vector2(pLowEndX, botY), dxKzPivot, 1, strokeStyleSolid);
+
+                                    if (ShowKzLabels)
+                                    {
+                                        var loRect = new SharpDX.RectangleF(pLowEndX - 80, botY + 2, 80, KzTextSize + 2);
+                                        RenderTarget.DrawText($"{kz.CodePrefix}.L", lblFormat, loRect, dxKzTxt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- RENDER FVGs & DAILY EQ ---
+            var scbBull = BullColor as SolidColorBrush;
+            var scbBear = BearColor as SolidColorBrush;
+            var scbBullIfvg = BullIfvgCol as SolidColorBrush;
+            var scbBearIfvg = BearIfvgCol as SolidColorBrush;
+            var scbEq = EqColor as SolidColorBrush;
+            var scbEqTxt = EqTextColor as SolidColorBrush;
+
+            if (scbBull == null || scbBear == null || scbEq == null || scbEqTxt == null) return;
+
+            using (var dxBull = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbBull.Color.R, (int)scbBull.Color.G, (int)scbBull.Color.B, (int)(FvgOpacity * 2.55f))))
+            using (var dxBear = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbBear.Color.R, (int)scbBear.Color.G, (int)scbBear.Color.B, (int)(FvgOpacity * 2.55f))))
+            using (var dxBullIfvg = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbBullIfvg.Color.R, (int)scbBullIfvg.Color.G, (int)scbBullIfvg.Color.B, (int)(FvgOpacity * 2.55f))))
+            using (var dxBearIfvg = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbBearIfvg.Color.R, (int)scbBearIfvg.Color.G, (int)scbBearIfvg.Color.B, (int)(FvgOpacity * 2.55f))))
+            using (var dxEq = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbEq.Color.R, (int)scbEq.Color.G, (int)scbEq.Color.B, 255)))
+            using (var dxEqTxt = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbEqTxt.Color.R, (int)scbEqTxt.Color.G, (int)scbEqTxt.Color.B, 255)))
+            using (var eqLblFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial", SharpDX.DirectWrite.FontWeight.Normal, SharpDX.DirectWrite.FontStyle.Normal, EqTextSize))
+            {
+                void DrawZoneBoxes(List<GapBox> list, SharpDX.Direct2D1.SolidColorBrush brush, int margin)
+                {
+                    foreach (var gb in list)
+                    {
+                        float startX = chartControl.GetXByTime(gb.BirthTime);
+                        float endX = gb.IsMitigated ? chartControl.GetXByTime(gb.DeathTime) : chartControl.GetXByTime(lastTime) + (margin * chartControl.Properties.BarDistance);
+                        float topY = chartScale.GetYByValue(gb.Top);
+                        float botY = chartScale.GetYByValue(gb.Bot);
+                        var rect = new SharpDX.RectangleF(startX, Math.Min(topY, botY), Math.Max(1, endX - startX), Math.Abs(topY - botY));
+                        RenderTarget.FillRectangle(rect, brush);
+                    }
+                }
+
+                if (EnableFVGs)
+                {
+                    DrawZoneBoxes(bullBoxes, dxBull, FixedFvgMargin);
+                    DrawZoneBoxes(bearBoxes, dxBear, FixedFvgMargin);
+                    DrawZoneBoxes(bullIfvgBoxes, dxBullIfvg, FixedIfvgMargin);
+                    DrawZoneBoxes(bearIfvgBoxes, dxBearIfvg, FixedIfvgMargin);
+                }
+
+                if (EnableEQ && dayStart != DateTime.MinValue)
+                {
+                    double equilibrium = (dayHigh + dayLow) / 2.0;
+                    float eqY = chartScale.GetYByValue(equilibrium);
+                    float startX = chartControl.GetXByTime(dayStart);
+                    float endX = chartControl.GetXByTime(lastTime) + (EqRightMargin * chartControl.Properties.BarDistance); 
+
+                    using (var strokeStyle = new SharpDX.Direct2D1.StrokeStyle(RenderTarget.Factory, new SharpDX.Direct2D1.StrokeStyleProperties { DashStyle = GetDXDash(EqStyle) }))
+                    {
+                        RenderTarget.DrawLine(new SharpDX.Vector2(startX, eqY), new SharpDX.Vector2(endX, eqY), dxEq, EqWidth, strokeStyle);
+                        eqLblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Leading; 
+                        RenderTarget.DrawText($"EQ: {equilibrium}", eqLblFormat, new SharpDX.RectangleF(endX + 5, eqY - EqTextSize, 100, 20), dxEqTxt);
+                    }
+                }
+            }
+        }
+
+        private SharpDX.Direct2D1.DashStyle GetDXDash(DashStyleHelper style)
+        {
+            switch (style)
+            {
+                case DashStyleHelper.Dash: return SharpDX.Direct2D1.DashStyle.Dash;
+                case DashStyleHelper.Dot: return SharpDX.Direct2D1.DashStyle.Dot;
+                default: return SharpDX.Direct2D1.DashStyle.Solid;
+            }
+        }
+
+        #region Properties
+
+        [NinjaScriptProperty]
+        [Display(Name="Enable FVGs & iFVGs", Order=1, GroupName="1. Master Toggles")]
+        public bool EnableFVGs { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Enable Daily Equilibrium", Order=2, GroupName="1. Master Toggles")]
+        public bool EnableEQ { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Enable Killzones & Pivots", Order=3, GroupName="1. Master Toggles")]
+        public bool EnableKillzones { get; set; }
+
+        // --- FVG SETTINGS ---
+        [NinjaScriptProperty]
+        [Display(Name="Size Unit: Ticks (Uncheck for Price)", Order=1, GroupName="2. FVG Settings")]
+        public bool SizeUnitIsTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name="Min Size", Order=2, GroupName="2. FVG Settings")]
+        public double MinSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name="Max Size", Order=3, GroupName="2. FVG Settings")]
+        public double MaxSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name="FVG Right Margin (Bars)", Order=1, GroupName="3. FVG Visuals & Cleanup")]
+        public int FixedFvgMargin { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, int.MaxValue)]
+        [Display(Name="iFVG Right Margin (Bars)", Order=2, GroupName="3. FVG Visuals & Cleanup")]
+        public int FixedIfvgMargin { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.5, double.MaxValue)]
+        [Display(Name="FVG Max Age (Hours)", Order=3, GroupName="3. FVG Visuals & Cleanup")]
+        public double MaxFvgAgeHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.5, double.MaxValue)]
+        [Display(Name="iFVG Max Age (Hours)", Order=4, GroupName="3. FVG Visuals & Cleanup")]
+        public double MaxIfvgAgeHours { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Delete Mitigated Boxes?", Order=5, GroupName="3. FVG Visuals & Cleanup")]
+        public bool DeleteMitigated { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Show Inversions (iFVGs)?", Order=6, GroupName="3. FVG Visuals & Cleanup")]
+        public bool ShowInversions { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Filter NY Open (09:30-09:35 Chart Time)?", Order=7, GroupName="3. FVG Visuals & Cleanup")]
+        public bool FilterNyOpen { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Bullish FVG Color", Order=8, GroupName="3. FVG Visuals & Cleanup")]
+        public Brush BullColor { get; set; }
+        [Browsable(false)] public string BullColorSerialize { get { return Serialize.BrushToString(BullColor); } set { BullColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Bearish FVG Color", Order=9, GroupName="3. FVG Visuals & Cleanup")]
+        public Brush BearColor { get; set; }
+        [Browsable(false)] public string BearColorSerialize { get { return Serialize.BrushToString(BearColor); } set { BearColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Bullish iFVG Color", Order=10, GroupName="3. FVG Visuals & Cleanup")]
+        public Brush BullIfvgCol { get; set; }
+        [Browsable(false)] public string BullIfvgColSerialize { get { return Serialize.BrushToString(BullIfvgCol); } set { BullIfvgCol = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Bearish iFVG Color", Order=11, GroupName="3. FVG Visuals & Cleanup")]
+        public Brush BearIfvgCol { get; set; }
+        [Browsable(false)] public string BearIfvgColSerialize { get { return Serialize.BrushToString(BearIfvgCol); } set { BearIfvgCol = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name="Zone Opacity (1-100)", Order=12, GroupName="3. FVG Visuals & Cleanup")]
+        public int FvgOpacity { get; set; }
+
+        // --- DAILY EQ ---
+        [XmlIgnore]
+        [Display(Name="Line Color", Order=1, GroupName="4. Daily Equilibrium")]
+        public Brush EqColor { get; set; }
+        [Browsable(false)] public string EqColorSerialize { get { return Serialize.BrushToString(EqColor); } set { EqColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Range(1, 5)]
+        [Display(Name="Line Width", Order=2, GroupName="4. Daily Equilibrium")]
+        public int EqWidth { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Line Style", Order=3, GroupName="4. Daily Equilibrium")]
+        public DashStyleHelper EqStyle { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Text Color", Order=4, GroupName="4. Daily Equilibrium")]
+        public Brush EqTextColor { get; set; }
+        [Browsable(false)] public string EqTextColorSerialize { get { return Serialize.BrushToString(EqTextColor); } set { EqTextColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Range(8, 24)]
+        [Display(Name="Text Size", Order=5, GroupName="4. Daily Equilibrium")]
+        public int EqTextSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 500)]
+        [Display(Name="Right Margin (Bars)", Order=6, GroupName="4. Daily Equilibrium")]
+        public int EqRightMargin { get; set; }
+
+        // --- KILLZONES ---
+        [NinjaScriptProperty]
+        [Display(Name="Show Killzone Pivots", Order=1, GroupName="5. Killzone Toggles")]
+        public bool ShowKzPivots { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Show Killzone Labels", Order=2, GroupName="5. Killzone Toggles")]
+        public bool ShowKzLabels { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Use Asia", Order=3, GroupName="5. Killzone Toggles")]
+        public bool UseAsia { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Draw Asia Box", Order=4, GroupName="5. Killzone Toggles")]
+        public bool DrawAsiaBox { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Use London", Order=5, GroupName="5. Killzone Toggles")]
+        public bool UseLondon { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Draw London Box", Order=6, GroupName="5. Killzone Toggles")]
+        public bool DrawLondonBox { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Use NY AM", Order=7, GroupName="5. Killzone Toggles")]
+        public bool UseNyAm { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Draw NY AM Box", Order=8, GroupName="5. Killzone Toggles")]
+        public bool DrawNyAmBox { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Use NY Lunch", Order=9, GroupName="5. Killzone Toggles")]
+        public bool UseNyLunch { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Draw NY Lunch Box", Order=10, GroupName="5. Killzone Toggles")]
+        public bool DrawNyLunchBox { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Use NY PM", Order=11, GroupName="5. Killzone Toggles")]
+        public bool UseNyPm { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Draw NY PM Box", Order=12, GroupName="5. Killzone Toggles")]
+        public bool DrawNyPmBox { get; set; }
+
+        // --- KILLZONE TIMES ---
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="Asia Start", Order=1, GroupName="6. Killzone Times")]
+        public DateTime AsiaStart { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="Asia End", Order=2, GroupName="6. Killzone Times")]
+        public DateTime AsiaEnd { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="London Start", Order=3, GroupName="6. Killzone Times")]
+        public DateTime LondonStart { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="London End", Order=4, GroupName="6. Killzone Times")]
+        public DateTime LondonEnd { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY AM Start", Order=5, GroupName="6. Killzone Times")]
+        public DateTime NyAmStart { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY AM End", Order=6, GroupName="6. Killzone Times")]
+        public DateTime NyAmEnd { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY Lunch Start", Order=7, GroupName="6. Killzone Times")]
+        public DateTime NyLunchStart { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY Lunch End", Order=8, GroupName="6. Killzone Times")]
+        public DateTime NyLunchEnd { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY PM Start", Order=9, GroupName="6. Killzone Times")]
+        public DateTime NyPmStart { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY PM End", Order=10, GroupName="6. Killzone Times")]
+        public DateTime NyPmEnd { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY Filter Start", Order=11, GroupName="6. Killzone Times")]
+        public DateTime NyFilterStart { get; set; }
+
+        [NinjaScriptProperty]
+        [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+        [Display(Name="NY Filter End", Order=12, GroupName="6. Killzone Times")]
+        public DateTime NyFilterEnd { get; set; }
+
+        // --- KILLZONE VISUALS ---
+        [XmlIgnore]
+        [Display(Name="Asia Color", Order=1, GroupName="7. Killzone Visuals")]
+        public Brush AsiaColor { get; set; }
+        [Browsable(false)] public string AsiaColorSerialize { get { return Serialize.BrushToString(AsiaColor); } set { AsiaColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="London Color", Order=2, GroupName="7. Killzone Visuals")]
+        public Brush LondonColor { get; set; }
+        [Browsable(false)] public string LondonColorSerialize { get { return Serialize.BrushToString(LondonColor); } set { LondonColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="NY AM Color", Order=3, GroupName="7. Killzone Visuals")]
+        public Brush NyAmColor { get; set; }
+        [Browsable(false)] public string NyAmColorSerialize { get { return Serialize.BrushToString(NyAmColor); } set { NyAmColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="NY Lunch Color", Order=4, GroupName="7. Killzone Visuals")]
+        public Brush NyLunchColor { get; set; }
+        [Browsable(false)] public string NyLunchColorSerialize { get { return Serialize.BrushToString(NyLunchColor); } set { NyLunchColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="NY PM Color", Order=5, GroupName="7. Killzone Visuals")]
+        public Brush NyPmColor { get; set; }
+        [Browsable(false)] public string NyPmColorSerialize { get { return Serialize.BrushToString(NyPmColor); } set { NyPmColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name="Killzone Opacity (1-100)", Order=6, GroupName="7. Killzone Visuals")]
+        public int KzOpacity { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 50)]
+        [Display(Name="Days to Keep (History)", Order=7, GroupName="7. Killzone Visuals")]
+        public int KzDaysToKeep { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Pivot Text Color", Order=8, GroupName="7. Killzone Visuals")]
+        public Brush KzTextColor { get; set; }
+        [Browsable(false)] public string KzTextColorSerialize { get { return Serialize.BrushToString(KzTextColor); } set { KzTextColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Range(8, 24)]
+        [Display(Name="Pivot Text Size", Order=9, GroupName="7. Killzone Visuals")]
+        public int KzTextSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 500)]
+        [Display(Name="Right Margin (Bars)", Order=10, GroupName="7. Killzone Visuals")]
+        public int KzRightMargin { get; set; }
+
+        // --- OPENING PRICES ---
+        [NinjaScriptProperty]
+        [Display(Name="Extension Mode", Order=1, GroupName="8. Opening Prices")]
+        public OpExtensionMode OpExtMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Text Alignment", Order=2, GroupName="8. Opening Prices")]
+        public TextAlignment OpTextAlign { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(8, 24)]
+        [Display(Name="Text Size", Order=3, GroupName="8. Opening Prices")]
+        public int OpTextSize { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Text Color", Order=4, GroupName="8. Opening Prices")]
+        public Brush OpTextColor { get; set; }
+        [Browsable(false)] public string OpTextColorSerialize { get { return Serialize.BrushToString(OpTextColor); } set { OpTextColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Display(Name="Line Style", Order=5, GroupName="8. Opening Prices")]
+        public DashStyleHelper OpStyle { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 5)]
+        [Display(Name="Line Width", Order=6, GroupName="8. Opening Prices")]
+        public int OpWidth { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 500)]
+        [Display(Name="Right Margin (Bars)", Order=7, GroupName="8. Opening Prices")]
+        public int OpRightMargin { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="1. Use", Order=10, GroupName="8. Opening Prices")] public bool Op1Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="1. Label", Order=11, GroupName="8. Opening Prices")] public string Op1Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="1. Time", Order=12, GroupName="8. Opening Prices")] public DateTime Op1Time { get; set; }
+        [XmlIgnore] [Display(Name="1. Color", Order=13, GroupName="8. Opening Prices")] public Brush Op1Color { get; set; }
+        [Browsable(false)] public string Op1ColorSerialize { get { return Serialize.BrushToString(Op1Color); } set { Op1Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="2. Use", Order=20, GroupName="8. Opening Prices")] public bool Op2Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="2. Label", Order=21, GroupName="8. Opening Prices")] public string Op2Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="2. Time", Order=22, GroupName="8. Opening Prices")] public DateTime Op2Time { get; set; }
+        [XmlIgnore] [Display(Name="2. Color", Order=23, GroupName="8. Opening Prices")] public Brush Op2Color { get; set; }
+        [Browsable(false)] public string Op2ColorSerialize { get { return Serialize.BrushToString(Op2Color); } set { Op2Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="3. Use", Order=30, GroupName="8. Opening Prices")] public bool Op3Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="3. Label", Order=31, GroupName="8. Opening Prices")] public string Op3Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="3. Time", Order=32, GroupName="8. Opening Prices")] public DateTime Op3Time { get; set; }
+        [XmlIgnore] [Display(Name="3. Color", Order=33, GroupName="8. Opening Prices")] public Brush Op3Color { get; set; }
+        [Browsable(false)] public string Op3ColorSerialize { get { return Serialize.BrushToString(Op3Color); } set { Op3Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="4. Use", Order=40, GroupName="8. Opening Prices")] public bool Op4Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="4. Label", Order=41, GroupName="8. Opening Prices")] public string Op4Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="4. Time", Order=42, GroupName="8. Opening Prices")] public DateTime Op4Time { get; set; }
+        [XmlIgnore] [Display(Name="4. Color", Order=43, GroupName="8. Opening Prices")] public Brush Op4Color { get; set; }
+        [Browsable(false)] public string Op4ColorSerialize { get { return Serialize.BrushToString(Op4Color); } set { Op4Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="5. Use", Order=50, GroupName="8. Opening Prices")] public bool Op5Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="5. Label", Order=51, GroupName="8. Opening Prices")] public string Op5Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="5. Time", Order=52, GroupName="8. Opening Prices")] public DateTime Op5Time { get; set; }
+        [XmlIgnore] [Display(Name="5. Color", Order=53, GroupName="8. Opening Prices")] public Brush Op5Color { get; set; }
+        [Browsable(false)] public string Op5ColorSerialize { get { return Serialize.BrushToString(Op5Color); } set { Op5Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="6. Use", Order=60, GroupName="8. Opening Prices")] public bool Op6Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="6. Label", Order=61, GroupName="8. Opening Prices")] public string Op6Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="6. Time", Order=62, GroupName="8. Opening Prices")] public DateTime Op6Time { get; set; }
+        [XmlIgnore] [Display(Name="6. Color", Order=63, GroupName="8. Opening Prices")] public Brush Op6Color { get; set; }
+        [Browsable(false)] public string Op6ColorSerialize { get { return Serialize.BrushToString(Op6Color); } set { Op6Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="7. Use", Order=70, GroupName="8. Opening Prices")] public bool Op7Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="7. Label", Order=71, GroupName="8. Opening Prices")] public string Op7Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="7. Time", Order=72, GroupName="8. Opening Prices")] public DateTime Op7Time { get; set; }
+        [XmlIgnore] [Display(Name="7. Color", Order=73, GroupName="8. Opening Prices")] public Brush Op7Color { get; set; }
+        [Browsable(false)] public string Op7ColorSerialize { get { return Serialize.BrushToString(Op7Color); } set { Op7Color = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty] [Display(Name="8. Use", Order=80, GroupName="8. Opening Prices")] public bool Op8Use { get; set; }
+        [NinjaScriptProperty] [Display(Name="8. Label", Order=81, GroupName="8. Opening Prices")] public string Op8Label { get; set; }
+        [NinjaScriptProperty] [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")] [Display(Name="8. Time", Order=82, GroupName="8. Opening Prices")] public DateTime Op8Time { get; set; }
+        [XmlIgnore] [Display(Name="8. Color", Order=83, GroupName="8. Opening Prices")] public Brush Op8Color { get; set; }
+        [Browsable(false)] public string Op8ColorSerialize { get { return Serialize.BrushToString(Op8Color); } set { Op8Color = Serialize.StringToBrush(value); } }
+
+        #endregion
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private FOProFVGEQ[] cacheFOProFVGEQ;
+		public FOProFVGEQ FOProFVGEQ(bool enableFVGs, bool enableEQ, bool enableKillzones, bool sizeUnitIsTicks, double minSize, double maxSize, int fixedFvgMargin, int fixedIfvgMargin, double maxFvgAgeHours, double maxIfvgAgeHours, bool deleteMitigated, bool showInversions, bool filterNyOpen, int fvgOpacity, int eqWidth, DashStyleHelper eqStyle, int eqTextSize, int eqRightMargin, bool showKzPivots, bool showKzLabels, bool useAsia, bool drawAsiaBox, bool useLondon, bool drawLondonBox, bool useNyAm, bool drawNyAmBox, bool useNyLunch, bool drawNyLunchBox, bool useNyPm, bool drawNyPmBox, DateTime asiaStart, DateTime asiaEnd, DateTime londonStart, DateTime londonEnd, DateTime nyAmStart, DateTime nyAmEnd, DateTime nyLunchStart, DateTime nyLunchEnd, DateTime nyPmStart, DateTime nyPmEnd, DateTime nyFilterStart, DateTime nyFilterEnd, int kzOpacity, int kzDaysToKeep, int kzTextSize, int kzRightMargin, OpExtensionMode opExtMode, TextAlignment opTextAlign, int opTextSize, DashStyleHelper opStyle, int opWidth, int opRightMargin, bool op1Use, string op1Label, DateTime op1Time, bool op2Use, string op2Label, DateTime op2Time, bool op3Use, string op3Label, DateTime op3Time, bool op4Use, string op4Label, DateTime op4Time, bool op5Use, string op5Label, DateTime op5Time, bool op6Use, string op6Label, DateTime op6Time, bool op7Use, string op7Label, DateTime op7Time, bool op8Use, string op8Label, DateTime op8Time)
+		{
+			return FOProFVGEQ(Input, enableFVGs, enableEQ, enableKillzones, sizeUnitIsTicks, minSize, maxSize, fixedFvgMargin, fixedIfvgMargin, maxFvgAgeHours, maxIfvgAgeHours, deleteMitigated, showInversions, filterNyOpen, fvgOpacity, eqWidth, eqStyle, eqTextSize, eqRightMargin, showKzPivots, showKzLabels, useAsia, drawAsiaBox, useLondon, drawLondonBox, useNyAm, drawNyAmBox, useNyLunch, drawNyLunchBox, useNyPm, drawNyPmBox, asiaStart, asiaEnd, londonStart, londonEnd, nyAmStart, nyAmEnd, nyLunchStart, nyLunchEnd, nyPmStart, nyPmEnd, nyFilterStart, nyFilterEnd, kzOpacity, kzDaysToKeep, kzTextSize, kzRightMargin, opExtMode, opTextAlign, opTextSize, opStyle, opWidth, opRightMargin, op1Use, op1Label, op1Time, op2Use, op2Label, op2Time, op3Use, op3Label, op3Time, op4Use, op4Label, op4Time, op5Use, op5Label, op5Time, op6Use, op6Label, op6Time, op7Use, op7Label, op7Time, op8Use, op8Label, op8Time);
+		}
+
+		public FOProFVGEQ FOProFVGEQ(ISeries<double> input, bool enableFVGs, bool enableEQ, bool enableKillzones, bool sizeUnitIsTicks, double minSize, double maxSize, int fixedFvgMargin, int fixedIfvgMargin, double maxFvgAgeHours, double maxIfvgAgeHours, bool deleteMitigated, bool showInversions, bool filterNyOpen, int fvgOpacity, int eqWidth, DashStyleHelper eqStyle, int eqTextSize, int eqRightMargin, bool showKzPivots, bool showKzLabels, bool useAsia, bool drawAsiaBox, bool useLondon, bool drawLondonBox, bool useNyAm, bool drawNyAmBox, bool useNyLunch, bool drawNyLunchBox, bool useNyPm, bool drawNyPmBox, DateTime asiaStart, DateTime asiaEnd, DateTime londonStart, DateTime londonEnd, DateTime nyAmStart, DateTime nyAmEnd, DateTime nyLunchStart, DateTime nyLunchEnd, DateTime nyPmStart, DateTime nyPmEnd, DateTime nyFilterStart, DateTime nyFilterEnd, int kzOpacity, int kzDaysToKeep, int kzTextSize, int kzRightMargin, OpExtensionMode opExtMode, TextAlignment opTextAlign, int opTextSize, DashStyleHelper opStyle, int opWidth, int opRightMargin, bool op1Use, string op1Label, DateTime op1Time, bool op2Use, string op2Label, DateTime op2Time, bool op3Use, string op3Label, DateTime op3Time, bool op4Use, string op4Label, DateTime op4Time, bool op5Use, string op5Label, DateTime op5Time, bool op6Use, string op6Label, DateTime op6Time, bool op7Use, string op7Label, DateTime op7Time, bool op8Use, string op8Label, DateTime op8Time)
+		{
+			if (cacheFOProFVGEQ != null)
+				for (int idx = 0; idx < cacheFOProFVGEQ.Length; idx++)
+					if (cacheFOProFVGEQ[idx] != null && cacheFOProFVGEQ[idx].EnableFVGs == enableFVGs && cacheFOProFVGEQ[idx].EnableEQ == enableEQ && cacheFOProFVGEQ[idx].EnableKillzones == enableKillzones && cacheFOProFVGEQ[idx].SizeUnitIsTicks == sizeUnitIsTicks && cacheFOProFVGEQ[idx].MinSize == minSize && cacheFOProFVGEQ[idx].MaxSize == maxSize && cacheFOProFVGEQ[idx].FixedFvgMargin == fixedFvgMargin && cacheFOProFVGEQ[idx].FixedIfvgMargin == fixedIfvgMargin && cacheFOProFVGEQ[idx].MaxFvgAgeHours == maxFvgAgeHours && cacheFOProFVGEQ[idx].MaxIfvgAgeHours == maxIfvgAgeHours && cacheFOProFVGEQ[idx].DeleteMitigated == deleteMitigated && cacheFOProFVGEQ[idx].ShowInversions == showInversions && cacheFOProFVGEQ[idx].FilterNyOpen == filterNyOpen && cacheFOProFVGEQ[idx].FvgOpacity == fvgOpacity && cacheFOProFVGEQ[idx].EqWidth == eqWidth && cacheFOProFVGEQ[idx].EqStyle == eqStyle && cacheFOProFVGEQ[idx].EqTextSize == eqTextSize && cacheFOProFVGEQ[idx].EqRightMargin == eqRightMargin && cacheFOProFVGEQ[idx].ShowKzPivots == showKzPivots && cacheFOProFVGEQ[idx].ShowKzLabels == showKzLabels && cacheFOProFVGEQ[idx].UseAsia == useAsia && cacheFOProFVGEQ[idx].DrawAsiaBox == drawAsiaBox && cacheFOProFVGEQ[idx].UseLondon == useLondon && cacheFOProFVGEQ[idx].DrawLondonBox == drawLondonBox && cacheFOProFVGEQ[idx].UseNyAm == useNyAm && cacheFOProFVGEQ[idx].DrawNyAmBox == drawNyAmBox && cacheFOProFVGEQ[idx].UseNyLunch == useNyLunch && cacheFOProFVGEQ[idx].DrawNyLunchBox == drawNyLunchBox && cacheFOProFVGEQ[idx].UseNyPm == useNyPm && cacheFOProFVGEQ[idx].DrawNyPmBox == drawNyPmBox && cacheFOProFVGEQ[idx].AsiaStart == asiaStart && cacheFOProFVGEQ[idx].AsiaEnd == asiaEnd && cacheFOProFVGEQ[idx].LondonStart == londonStart && cacheFOProFVGEQ[idx].LondonEnd == londonEnd && cacheFOProFVGEQ[idx].NyAmStart == nyAmStart && cacheFOProFVGEQ[idx].NyAmEnd == nyAmEnd && cacheFOProFVGEQ[idx].NyLunchStart == nyLunchStart && cacheFOProFVGEQ[idx].NyLunchEnd == nyLunchEnd && cacheFOProFVGEQ[idx].NyPmStart == nyPmStart && cacheFOProFVGEQ[idx].NyPmEnd == nyPmEnd && cacheFOProFVGEQ[idx].NyFilterStart == nyFilterStart && cacheFOProFVGEQ[idx].NyFilterEnd == nyFilterEnd && cacheFOProFVGEQ[idx].KzOpacity == kzOpacity && cacheFOProFVGEQ[idx].KzDaysToKeep == kzDaysToKeep && cacheFOProFVGEQ[idx].KzTextSize == kzTextSize && cacheFOProFVGEQ[idx].KzRightMargin == kzRightMargin && cacheFOProFVGEQ[idx].OpExtMode == opExtMode && cacheFOProFVGEQ[idx].OpTextAlign == opTextAlign && cacheFOProFVGEQ[idx].OpTextSize == opTextSize && cacheFOProFVGEQ[idx].OpStyle == opStyle && cacheFOProFVGEQ[idx].OpWidth == opWidth && cacheFOProFVGEQ[idx].OpRightMargin == opRightMargin && cacheFOProFVGEQ[idx].Op1Use == op1Use && cacheFOProFVGEQ[idx].Op1Label == op1Label && cacheFOProFVGEQ[idx].Op1Time == op1Time && cacheFOProFVGEQ[idx].Op2Use == op2Use && cacheFOProFVGEQ[idx].Op2Label == op2Label && cacheFOProFVGEQ[idx].Op2Time == op2Time && cacheFOProFVGEQ[idx].Op3Use == op3Use && cacheFOProFVGEQ[idx].Op3Label == op3Label && cacheFOProFVGEQ[idx].Op3Time == op3Time && cacheFOProFVGEQ[idx].Op4Use == op4Use && cacheFOProFVGEQ[idx].Op4Label == op4Label && cacheFOProFVGEQ[idx].Op4Time == op4Time && cacheFOProFVGEQ[idx].Op5Use == op5Use && cacheFOProFVGEQ[idx].Op5Label == op5Label && cacheFOProFVGEQ[idx].Op5Time == op5Time && cacheFOProFVGEQ[idx].Op6Use == op6Use && cacheFOProFVGEQ[idx].Op6Label == op6Label && cacheFOProFVGEQ[idx].Op6Time == op6Time && cacheFOProFVGEQ[idx].Op7Use == op7Use && cacheFOProFVGEQ[idx].Op7Label == op7Label && cacheFOProFVGEQ[idx].Op7Time == op7Time && cacheFOProFVGEQ[idx].Op8Use == op8Use && cacheFOProFVGEQ[idx].Op8Label == op8Label && cacheFOProFVGEQ[idx].Op8Time == op8Time && cacheFOProFVGEQ[idx].EqualsInput(input))
+						return cacheFOProFVGEQ[idx];
+			return CacheIndicator<FOProFVGEQ>(new FOProFVGEQ(){ EnableFVGs = enableFVGs, EnableEQ = enableEQ, EnableKillzones = enableKillzones, SizeUnitIsTicks = sizeUnitIsTicks, MinSize = minSize, MaxSize = maxSize, FixedFvgMargin = fixedFvgMargin, FixedIfvgMargin = fixedIfvgMargin, MaxFvgAgeHours = maxFvgAgeHours, MaxIfvgAgeHours = maxIfvgAgeHours, DeleteMitigated = deleteMitigated, ShowInversions = showInversions, FilterNyOpen = filterNyOpen, FvgOpacity = fvgOpacity, EqWidth = eqWidth, EqStyle = eqStyle, EqTextSize = eqTextSize, EqRightMargin = eqRightMargin, ShowKzPivots = showKzPivots, ShowKzLabels = showKzLabels, UseAsia = useAsia, DrawAsiaBox = drawAsiaBox, UseLondon = useLondon, DrawLondonBox = drawLondonBox, UseNyAm = useNyAm, DrawNyAmBox = drawNyAmBox, UseNyLunch = useNyLunch, DrawNyLunchBox = drawNyLunchBox, UseNyPm = useNyPm, DrawNyPmBox = drawNyPmBox, AsiaStart = asiaStart, AsiaEnd = asiaEnd, LondonStart = londonStart, LondonEnd = londonEnd, NyAmStart = nyAmStart, NyAmEnd = nyAmEnd, NyLunchStart = nyLunchStart, NyLunchEnd = nyLunchEnd, NyPmStart = nyPmStart, NyPmEnd = nyPmEnd, NyFilterStart = nyFilterStart, NyFilterEnd = nyFilterEnd, KzOpacity = kzOpacity, KzDaysToKeep = kzDaysToKeep, KzTextSize = kzTextSize, KzRightMargin = kzRightMargin, OpExtMode = opExtMode, OpTextAlign = opTextAlign, OpTextSize = opTextSize, OpStyle = opStyle, OpWidth = opWidth, OpRightMargin = opRightMargin, Op1Use = op1Use, Op1Label = op1Label, Op1Time = op1Time, Op2Use = op2Use, Op2Label = op2Label, Op2Time = op2Time, Op3Use = op3Use, Op3Label = op3Label, Op3Time = op3Time, Op4Use = op4Use, Op4Label = op4Label, Op4Time = op4Time, Op5Use = op5Use, Op5Label = op5Label, Op5Time = op5Time, Op6Use = op6Use, Op6Label = op6Label, Op6Time = op6Time, Op7Use = op7Use, Op7Label = op7Label, Op7Time = op7Time, Op8Use = op8Use, Op8Label = op8Label, Op8Time = op8Time }, input, ref cacheFOProFVGEQ);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.FOProFVGEQ FOProFVGEQ(bool enableFVGs, bool enableEQ, bool enableKillzones, bool sizeUnitIsTicks, double minSize, double maxSize, int fixedFvgMargin, int fixedIfvgMargin, double maxFvgAgeHours, double maxIfvgAgeHours, bool deleteMitigated, bool showInversions, bool filterNyOpen, int fvgOpacity, int eqWidth, DashStyleHelper eqStyle, int eqTextSize, int eqRightMargin, bool showKzPivots, bool showKzLabels, bool useAsia, bool drawAsiaBox, bool useLondon, bool drawLondonBox, bool useNyAm, bool drawNyAmBox, bool useNyLunch, bool drawNyLunchBox, bool useNyPm, bool drawNyPmBox, DateTime asiaStart, DateTime asiaEnd, DateTime londonStart, DateTime londonEnd, DateTime nyAmStart, DateTime nyAmEnd, DateTime nyLunchStart, DateTime nyLunchEnd, DateTime nyPmStart, DateTime nyPmEnd, DateTime nyFilterStart, DateTime nyFilterEnd, int kzOpacity, int kzDaysToKeep, int kzTextSize, int kzRightMargin, OpExtensionMode opExtMode, TextAlignment opTextAlign, int opTextSize, DashStyleHelper opStyle, int opWidth, int opRightMargin, bool op1Use, string op1Label, DateTime op1Time, bool op2Use, string op2Label, DateTime op2Time, bool op3Use, string op3Label, DateTime op3Time, bool op4Use, string op4Label, DateTime op4Time, bool op5Use, string op5Label, DateTime op5Time, bool op6Use, string op6Label, DateTime op6Time, bool op7Use, string op7Label, DateTime op7Time, bool op8Use, string op8Label, DateTime op8Time)
+		{
+			return indicator.FOProFVGEQ(Input, enableFVGs, enableEQ, enableKillzones, sizeUnitIsTicks, minSize, maxSize, fixedFvgMargin, fixedIfvgMargin, maxFvgAgeHours, maxIfvgAgeHours, deleteMitigated, showInversions, filterNyOpen, fvgOpacity, eqWidth, eqStyle, eqTextSize, eqRightMargin, showKzPivots, showKzLabels, useAsia, drawAsiaBox, useLondon, drawLondonBox, useNyAm, drawNyAmBox, useNyLunch, drawNyLunchBox, useNyPm, drawNyPmBox, asiaStart, asiaEnd, londonStart, londonEnd, nyAmStart, nyAmEnd, nyLunchStart, nyLunchEnd, nyPmStart, nyPmEnd, nyFilterStart, nyFilterEnd, kzOpacity, kzDaysToKeep, kzTextSize, kzRightMargin, opExtMode, opTextAlign, opTextSize, opStyle, opWidth, opRightMargin, op1Use, op1Label, op1Time, op2Use, op2Label, op2Time, op3Use, op3Label, op3Time, op4Use, op4Label, op4Time, op5Use, op5Label, op5Time, op6Use, op6Label, op6Time, op7Use, op7Label, op7Time, op8Use, op8Label, op8Time);
+		}
+
+		public Indicators.FOProFVGEQ FOProFVGEQ(ISeries<double> input , bool enableFVGs, bool enableEQ, bool enableKillzones, bool sizeUnitIsTicks, double minSize, double maxSize, int fixedFvgMargin, int fixedIfvgMargin, double maxFvgAgeHours, double maxIfvgAgeHours, bool deleteMitigated, bool showInversions, bool filterNyOpen, int fvgOpacity, int eqWidth, DashStyleHelper eqStyle, int eqTextSize, int eqRightMargin, bool showKzPivots, bool showKzLabels, bool useAsia, bool drawAsiaBox, bool useLondon, bool drawLondonBox, bool useNyAm, bool drawNyAmBox, bool useNyLunch, bool drawNyLunchBox, bool useNyPm, bool drawNyPmBox, DateTime asiaStart, DateTime asiaEnd, DateTime londonStart, DateTime londonEnd, DateTime nyAmStart, DateTime nyAmEnd, DateTime nyLunchStart, DateTime nyLunchEnd, DateTime nyPmStart, DateTime nyPmEnd, DateTime nyFilterStart, DateTime nyFilterEnd, int kzOpacity, int kzDaysToKeep, int kzTextSize, int kzRightMargin, OpExtensionMode opExtMode, TextAlignment opTextAlign, int opTextSize, DashStyleHelper opStyle, int opWidth, int opRightMargin, bool op1Use, string op1Label, DateTime op1Time, bool op2Use, string op2Label, DateTime op2Time, bool op3Use, string op3Label, DateTime op3Time, bool op4Use, string op4Label, DateTime op4Time, bool op5Use, string op5Label, DateTime op5Time, bool op6Use, string op6Label, DateTime op6Time, bool op7Use, string op7Label, DateTime op7Time, bool op8Use, string op8Label, DateTime op8Time)
+		{
+			return indicator.FOProFVGEQ(input, enableFVGs, enableEQ, enableKillzones, sizeUnitIsTicks, minSize, maxSize, fixedFvgMargin, fixedIfvgMargin, maxFvgAgeHours, maxIfvgAgeHours, deleteMitigated, showInversions, filterNyOpen, fvgOpacity, eqWidth, eqStyle, eqTextSize, eqRightMargin, showKzPivots, showKzLabels, useAsia, drawAsiaBox, useLondon, drawLondonBox, useNyAm, drawNyAmBox, useNyLunch, drawNyLunchBox, useNyPm, drawNyPmBox, asiaStart, asiaEnd, londonStart, londonEnd, nyAmStart, nyAmEnd, nyLunchStart, nyLunchEnd, nyPmStart, nyPmEnd, nyFilterStart, nyFilterEnd, kzOpacity, kzDaysToKeep, kzTextSize, kzRightMargin, opExtMode, opTextAlign, opTextSize, opStyle, opWidth, opRightMargin, op1Use, op1Label, op1Time, op2Use, op2Label, op2Time, op3Use, op3Label, op3Time, op4Use, op4Label, op4Time, op5Use, op5Label, op5Time, op6Use, op6Label, op6Time, op7Use, op7Label, op7Time, op8Use, op8Label, op8Time);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.FOProFVGEQ FOProFVGEQ(bool enableFVGs, bool enableEQ, bool enableKillzones, bool sizeUnitIsTicks, double minSize, double maxSize, int fixedFvgMargin, int fixedIfvgMargin, double maxFvgAgeHours, double maxIfvgAgeHours, bool deleteMitigated, bool showInversions, bool filterNyOpen, int fvgOpacity, int eqWidth, DashStyleHelper eqStyle, int eqTextSize, int eqRightMargin, bool showKzPivots, bool showKzLabels, bool useAsia, bool drawAsiaBox, bool useLondon, bool drawLondonBox, bool useNyAm, bool drawNyAmBox, bool useNyLunch, bool drawNyLunchBox, bool useNyPm, bool drawNyPmBox, DateTime asiaStart, DateTime asiaEnd, DateTime londonStart, DateTime londonEnd, DateTime nyAmStart, DateTime nyAmEnd, DateTime nyLunchStart, DateTime nyLunchEnd, DateTime nyPmStart, DateTime nyPmEnd, DateTime nyFilterStart, DateTime nyFilterEnd, int kzOpacity, int kzDaysToKeep, int kzTextSize, int kzRightMargin, OpExtensionMode opExtMode, TextAlignment opTextAlign, int opTextSize, DashStyleHelper opStyle, int opWidth, int opRightMargin, bool op1Use, string op1Label, DateTime op1Time, bool op2Use, string op2Label, DateTime op2Time, bool op3Use, string op3Label, DateTime op3Time, bool op4Use, string op4Label, DateTime op4Time, bool op5Use, string op5Label, DateTime op5Time, bool op6Use, string op6Label, DateTime op6Time, bool op7Use, string op7Label, DateTime op7Time, bool op8Use, string op8Label, DateTime op8Time)
+		{
+			return indicator.FOProFVGEQ(Input, enableFVGs, enableEQ, enableKillzones, sizeUnitIsTicks, minSize, maxSize, fixedFvgMargin, fixedIfvgMargin, maxFvgAgeHours, maxIfvgAgeHours, deleteMitigated, showInversions, filterNyOpen, fvgOpacity, eqWidth, eqStyle, eqTextSize, eqRightMargin, showKzPivots, showKzLabels, useAsia, drawAsiaBox, useLondon, drawLondonBox, useNyAm, drawNyAmBox, useNyLunch, drawNyLunchBox, useNyPm, drawNyPmBox, asiaStart, asiaEnd, londonStart, londonEnd, nyAmStart, nyAmEnd, nyLunchStart, nyLunchEnd, nyPmStart, nyPmEnd, nyFilterStart, nyFilterEnd, kzOpacity, kzDaysToKeep, kzTextSize, kzRightMargin, opExtMode, opTextAlign, opTextSize, opStyle, opWidth, opRightMargin, op1Use, op1Label, op1Time, op2Use, op2Label, op2Time, op3Use, op3Label, op3Time, op4Use, op4Label, op4Time, op5Use, op5Label, op5Time, op6Use, op6Label, op6Time, op7Use, op7Label, op7Time, op8Use, op8Label, op8Time);
+		}
+
+		public Indicators.FOProFVGEQ FOProFVGEQ(ISeries<double> input , bool enableFVGs, bool enableEQ, bool enableKillzones, bool sizeUnitIsTicks, double minSize, double maxSize, int fixedFvgMargin, int fixedIfvgMargin, double maxFvgAgeHours, double maxIfvgAgeHours, bool deleteMitigated, bool showInversions, bool filterNyOpen, int fvgOpacity, int eqWidth, DashStyleHelper eqStyle, int eqTextSize, int eqRightMargin, bool showKzPivots, bool showKzLabels, bool useAsia, bool drawAsiaBox, bool useLondon, bool drawLondonBox, bool useNyAm, bool drawNyAmBox, bool useNyLunch, bool drawNyLunchBox, bool useNyPm, bool drawNyPmBox, DateTime asiaStart, DateTime asiaEnd, DateTime londonStart, DateTime londonEnd, DateTime nyAmStart, DateTime nyAmEnd, DateTime nyLunchStart, DateTime nyLunchEnd, DateTime nyPmStart, DateTime nyPmEnd, DateTime nyFilterStart, DateTime nyFilterEnd, int kzOpacity, int kzDaysToKeep, int kzTextSize, int kzRightMargin, OpExtensionMode opExtMode, TextAlignment opTextAlign, int opTextSize, DashStyleHelper opStyle, int opWidth, int opRightMargin, bool op1Use, string op1Label, DateTime op1Time, bool op2Use, string op2Label, DateTime op2Time, bool op3Use, string op3Label, DateTime op3Time, bool op4Use, string op4Label, DateTime op4Time, bool op5Use, string op5Label, DateTime op5Time, bool op6Use, string op6Label, DateTime op6Time, bool op7Use, string op7Label, DateTime op7Time, bool op8Use, string op8Label, DateTime op8Time)
+		{
+			return indicator.FOProFVGEQ(input, enableFVGs, enableEQ, enableKillzones, sizeUnitIsTicks, minSize, maxSize, fixedFvgMargin, fixedIfvgMargin, maxFvgAgeHours, maxIfvgAgeHours, deleteMitigated, showInversions, filterNyOpen, fvgOpacity, eqWidth, eqStyle, eqTextSize, eqRightMargin, showKzPivots, showKzLabels, useAsia, drawAsiaBox, useLondon, drawLondonBox, useNyAm, drawNyAmBox, useNyLunch, drawNyLunchBox, useNyPm, drawNyPmBox, asiaStart, asiaEnd, londonStart, londonEnd, nyAmStart, nyAmEnd, nyLunchStart, nyLunchEnd, nyPmStart, nyPmEnd, nyFilterStart, nyFilterEnd, kzOpacity, kzDaysToKeep, kzTextSize, kzRightMargin, opExtMode, opTextAlign, opTextSize, opStyle, opWidth, opRightMargin, op1Use, op1Label, op1Time, op2Use, op2Label, op2Time, op3Use, op3Label, op3Time, op4Use, op4Label, op4Time, op5Use, op5Label, op5Time, op6Use, op6Label, op6Time, op7Use, op7Label, op7Time, op8Use, op8Label, op8Time);
+		}
+	}
+}
+
+#endregion
