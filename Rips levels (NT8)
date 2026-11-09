@@ -1,0 +1,509 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+public enum RipsMode
+{
+    Auto,
+    ES,
+    NQ,
+    Both
+}
+
+public enum RipsTablePos
+{
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight
+}
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class RipsLevels : Indicator
+    {
+        private Button toggleButton;
+        private Border buttonContainer; 
+        
+        // Tool now initializes in the OFF state
+        private bool isToolActive = false;
+        
+        private List<double> activeLevels = new List<double>();
+        private ATR atr14;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "RIPS Daily Orderflow Levels with ATR Table";
+                Name = "RipsLevels";
+                Calculate = Calculate.OnPriceChange;
+                IsOverlay = true;
+                DisplayInDataBox = false;
+                PaintPriceMarkers = false;
+
+                // 0. UI Button Placement & Colors
+                ButtonXOffset = 80; 
+                ButtonYOffset = 25;
+                ButtonOnColor = Brushes.Yellow;
+                ButtonOffColor = Brushes.DimGray;
+
+                // 1. Inputs
+                EsLevelsStr = "7684.00, 7656.25, 7638.75, 7624.75, 7605.25, 7593.00, 7583.00, 7565.75, 7550.25, 7541.50, 7529.00, 7516.50, 7509.00, 7502.75, 7496.50, 7492.25, 7483.00, 7477.00, 7467.75, 7461.00, 7449.75, 7438.50, 7429.50, 7420.50, 7413.50, 7407.75, 7399.00, 7391.25, 7377.50, 7366.50";
+                NqLevelsStr = "30830.00, 30663.25, 30560.00, 30475.50, 30376.25, 30314.75, 30265.25, 30215.50, 30178.00, 30122.00, 30030.25, 29973.25, 29925.50, 29881.25, 29826.50, 29789.25, 29732.25, 29685.50, 29640.50, 29586.25, 29525.25, 29473.25, 29426.00, 29390.00, 29354.25, 29301.75, 29262.75, 29210.75, 29116.75, 29059.75, 29011.50, 28964.75";
+                DetectMode = RipsMode.Auto;
+
+                // 2. Style
+                LineColor = Brushes.Yellow;
+                LineStyle = DashStyleHelper.Solid;
+                LineWidth = 1;
+
+                // 3. Labels
+                ShowLabels = true;
+                LabelTextSize = 11;
+                LabelTextColor = Brushes.Black;
+                LabelBgColor = Brushes.Yellow;
+                LabelOffsetBars = 5;
+
+                // 4. Info Table
+                ShowTable = true;
+                TablePosition = RipsTablePos.TopRight;
+                TableTextSize = 12;
+                TableHdrBg = Brushes.LimeGreen;
+                TableHdrText = Brushes.Black;
+                TableBg = Brushes.DarkSlateGray;
+                TableText = Brushes.White;
+                TableBorder = Brushes.Gray;
+            }
+            else if (State == State.DataLoaded)
+            {
+                atr14 = ATR(14);
+                ParseActiveLevels();
+            }
+            else if (State == State.Historical)
+            {
+                if (ChartControl != null)
+                {
+                    ChartControl.Dispatcher.InvokeAsync(() => { CreateWPFControls(); });
+                }
+            }
+            else if (State == State.Terminated)
+            {
+                if (ChartControl != null)
+                {
+                    ChartControl.Dispatcher.InvokeAsync(() => { DisposeWPFControls(); });
+                }
+            }
+        }
+
+        private void ParseActiveLevels()
+        {
+            activeLevels.Clear();
+            if (Instrument == null) return;
+            
+            string name = Instrument.FullName.ToUpper();
+            
+            bool isES = name.Contains("ES") || name.Contains("SPX") || name.Contains("SPY");
+            bool isNQ = name.Contains("NQ") || name.Contains("NDX") || name.Contains("QQQ");
+
+            bool drawES = DetectMode == RipsMode.ES || DetectMode == RipsMode.Both || (DetectMode == RipsMode.Auto && isES);
+            bool drawNQ = DetectMode == RipsMode.NQ || DetectMode == RipsMode.Both || (DetectMode == RipsMode.Auto && isNQ);
+
+            if (drawES) LoadFromString(EsLevelsStr);
+            if (drawNQ) LoadFromString(NqLevelsStr);
+        }
+
+        private void LoadFromString(string inputStr)
+        {
+            if (string.IsNullOrWhiteSpace(inputStr)) return;
+            string[] parts = inputStr.Split(new char[] { ',', ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            
+            foreach (string p in parts)
+            {
+                if (double.TryParse(p, out double val))
+                {
+                    if (!activeLevels.Contains(val)) activeLevels.Add(val);
+                }
+            }
+        }
+
+        #region WPF UI Button Setup
+        private void CreateWPFControls()
+        {
+            if (buttonContainer != null) return;
+
+            toggleButton = new Button()
+            {
+                Content = isToolActive ? "RIPS: ON" : "RIPS: OFF",
+                Background = isToolActive ? ButtonOnColor : ButtonOffColor,
+                Foreground = Brushes.Black,
+                FontWeight = FontWeights.Bold,
+                FontSize = 12,
+                BorderBrush = Brushes.Transparent, 
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(10, 4, 10, 4),
+                Cursor = Cursors.Arrow,
+                Focusable = false
+            };
+
+            toggleButton.Click += ToggleButton_Click;
+
+            buttonContainer = new Border()
+            {
+                Background = new SolidColorBrush(Color.FromArgb(220, 30, 30, 30)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(255, 90, 90, 90)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(2),
+                Padding = new Thickness(2), 
+                Margin = new Thickness(ButtonXOffset, ButtonYOffset, 0, 0),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                Child = toggleButton
+            };
+
+            UserControlCollection.Add(buttonContainer);
+        }
+
+        private void DisposeWPFControls()
+        {
+            if (buttonContainer != null)
+            {
+                if (toggleButton != null) toggleButton.Click -= ToggleButton_Click;
+                UserControlCollection.Remove(buttonContainer);
+                buttonContainer = null;
+                toggleButton = null;
+            }
+        }
+
+        private void ToggleButton_Click(object sender, RoutedEventArgs e)
+        {
+            isToolActive = !isToolActive;
+            
+            TriggerCustomEvent(o =>
+            {
+                if (isToolActive)
+                {
+                    toggleButton.Content = "RIPS: ON";
+                    toggleButton.Background = ButtonOnColor;
+                }
+                else
+                {
+                    toggleButton.Content = "RIPS: OFF";
+                    toggleButton.Background = ButtonOffColor;
+                }
+                ChartControl?.InvalidateVisual();
+            }, null);
+        }
+        #endregion
+
+        protected override void OnBarUpdate() { }
+
+        protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
+        {
+            base.OnRender(chartControl, chartScale);
+
+            if (!isToolActive || Bars == null || ChartPanel == null || activeLevels.Count == 0) return;
+
+            DateTime lastTime = Bars.GetTime(Bars.Count - 1);
+            float screenWidth = (float)RenderTarget.Size.Width;
+            float endBarX = chartControl.GetXByTime(lastTime);
+            float labelX = endBarX + (LabelOffsetBars * chartControl.Properties.BarDistance);
+
+            var scbLine = LineColor as SolidColorBrush;
+            var scbLblText = LabelTextColor as SolidColorBrush;
+            var scbLblBg = LabelBgColor as SolidColorBrush;
+
+            if (scbLine == null || scbLblText == null || scbLblBg == null) return;
+
+            using (var dxLine = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbLine.Color.R, (int)scbLine.Color.G, (int)scbLine.Color.B, 255)))
+            using (var dxLblText = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbLblText.Color.R, (int)scbLblText.Color.G, (int)scbLblText.Color.B, 255)))
+            using (var dxLblBg = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbLblBg.Color.R, (int)scbLblBg.Color.G, (int)scbLblBg.Color.B, 255)))
+            using (var strokeStyle = new SharpDX.Direct2D1.StrokeStyle(RenderTarget.Factory, new SharpDX.Direct2D1.StrokeStyleProperties { DashStyle = GetDXDash(LineStyle) }))
+            using (var lblFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial", SharpDX.DirectWrite.FontWeight.Bold, SharpDX.DirectWrite.FontStyle.Normal, LabelTextSize))
+            {
+                lblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Leading;
+
+                // 1. RENDER INFINITE LINES & LABELS
+                foreach (double lvl in activeLevels)
+                {
+                    float y = chartScale.GetYByValue(lvl);
+                    
+                    // Infinite Horizontal Line
+                    RenderTarget.DrawLine(new SharpDX.Vector2(0, y), new SharpDX.Vector2(screenWidth, y), dxLine, LineWidth, strokeStyle);
+
+                    // Offset Price Label
+                    if (ShowLabels)
+                    {
+                        string txt = lvl.ToString("F2");
+                        float txtWidth = txt.Length * (LabelTextSize * 0.6f) + 4;
+                        float txtHeight = LabelTextSize + 4;
+                        
+                        var bgRect = new SharpDX.RectangleF(labelX, y - (txtHeight/2), txtWidth, txtHeight);
+                        var txtRect = new SharpDX.RectangleF(labelX + 2, y - (LabelTextSize/2), txtWidth, LabelTextSize + 2);
+
+                        RenderTarget.FillRectangle(bgRect, dxLblBg);
+                        RenderTarget.DrawText(txt, lblFormat, txtRect, dxLblText);
+                    }
+                }
+
+                // 2. RENDER ATR TABLE
+                if (ShowTable && atr14 != null && CurrentBar > 14)
+                {
+                    RenderATRTable((float)RenderTarget.Size.Height, screenWidth);
+                }
+            }
+        }
+
+        private void RenderATRTable(float screenH, float screenW)
+        {
+            var scbHdrBg = TableHdrBg as SolidColorBrush;
+            var scbHdrTxt = TableHdrText as SolidColorBrush;
+            var scbBg = TableBg as SolidColorBrush;
+            var scbTxt = TableText as SolidColorBrush;
+            var scbBorder = TableBorder as SolidColorBrush;
+
+            if (scbHdrBg == null || scbHdrTxt == null || scbBg == null || scbTxt == null || scbBorder == null) return;
+
+            using (var dxHdrBg = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbHdrBg.Color.R, (int)scbHdrBg.Color.G, (int)scbHdrBg.Color.B, 255)))
+            using (var dxHdrTxt = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbHdrTxt.Color.R, (int)scbHdrTxt.Color.G, (int)scbHdrTxt.Color.B, 255)))
+            using (var dxBg = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbBg.Color.R, (int)scbBg.Color.G, (int)scbBg.Color.B, 255)))
+            using (var dxTxt = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbTxt.Color.R, (int)scbTxt.Color.G, (int)scbTxt.Color.B, 255)))
+            using (var dxBorder = new SharpDX.Direct2D1.SolidColorBrush(RenderTarget, new SharpDX.Color((int)scbBorder.Color.R, (int)scbBorder.Color.G, (int)scbBorder.Color.B, 255)))
+            using (var tblFormat = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial", SharpDX.DirectWrite.FontWeight.Bold, SharpDX.DirectWrite.FontStyle.Normal, TableTextSize))
+            {
+                tblFormat.TextAlignment = SharpDX.DirectWrite.TextAlignment.Center;
+                
+                float cellW = 100f;
+                float cellH = TableTextSize + 10f;
+                float tblW = cellW * 2;
+                float tblH = cellH * 2;
+
+                float startX = 20;
+                float startY = 20;
+
+                // Positioning
+                if (TablePosition == RipsTablePos.TopRight || TablePosition == RipsTablePos.BottomRight) startX = screenW - tblW - 20;
+                if (TablePosition == RipsTablePos.BottomLeft || TablePosition == RipsTablePos.BottomRight) startY = screenH - tblH - 20;
+
+                // Header Cell (Merged)
+                var hdrRect = new SharpDX.RectangleF(startX, startY, tblW, cellH);
+                RenderTarget.FillRectangle(hdrRect, dxHdrBg);
+                RenderTarget.DrawRectangle(hdrRect, dxBorder, 1);
+                RenderTarget.DrawText("RIPS Levels", tblFormat, new SharpDX.RectangleF(startX, startY + 4, tblW, cellH), dxHdrTxt);
+
+                // ATR Label Cell
+                var atrLblRect = new SharpDX.RectangleF(startX, startY + cellH, cellW, cellH);
+                RenderTarget.FillRectangle(atrLblRect, dxBg);
+                RenderTarget.DrawRectangle(atrLblRect, dxBorder, 1);
+                RenderTarget.DrawText("ATR", tblFormat, new SharpDX.RectangleF(startX, startY + cellH + 4, cellW, cellH), dxTxt);
+
+                // ATR Value Cell
+                var atrValRect = new SharpDX.RectangleF(startX + cellW, startY + cellH, cellW, cellH);
+                RenderTarget.FillRectangle(atrValRect, dxBg);
+                RenderTarget.DrawRectangle(atrValRect, dxBorder, 1);
+                RenderTarget.DrawText(atr14[0].ToString("F2"), tblFormat, new SharpDX.RectangleF(startX + cellW, startY + cellH + 4, cellW, cellH), dxTxt);
+            }
+        }
+
+        private SharpDX.Direct2D1.DashStyle GetDXDash(DashStyleHelper style)
+        {
+            switch (style)
+            {
+                case DashStyleHelper.Dash: return SharpDX.Direct2D1.DashStyle.Dash;
+                case DashStyleHelper.Dot: return SharpDX.Direct2D1.DashStyle.Dot;
+                default: return SharpDX.Direct2D1.DashStyle.Solid;
+            }
+        }
+
+        #region Properties
+        
+        [NinjaScriptProperty]
+        [Range(0, 2000)]
+        [Display(Name="Button X Offset (Left/Right)", Order=1, GroupName="0. UI Button Placement")]
+        public int ButtonXOffset { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2000)]
+        [Display(Name="Button Y Offset (Up/Down)", Order=2, GroupName="0. UI Button Placement")]
+        public int ButtonYOffset { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Button ON Color", Order=3, GroupName="0. UI Button Placement")]
+        public Brush ButtonOnColor { get; set; }
+        [Browsable(false)] public string ButtonOnColorSerialize { get { return Serialize.BrushToString(ButtonOnColor); } set { ButtonOnColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Button OFF Color", Order=4, GroupName="0. UI Button Placement")]
+        public Brush ButtonOffColor { get; set; }
+        [Browsable(false)] public string ButtonOffColorSerialize { get { return Serialize.BrushToString(ButtonOffColor); } set { ButtonOffColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Display(Name="Detect Mode", Order=1, GroupName="1. Inputs")]
+        public RipsMode DetectMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="ES Levels", Order=2, GroupName="1. Inputs")]
+        public string EsLevelsStr { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="NQ Levels", Order=3, GroupName="1. Inputs")]
+        public string NqLevelsStr { get; set; }
+
+        // --- STYLE ---
+        [XmlIgnore]
+        [Display(Name="Line Color", Order=1, GroupName="2. Style")]
+        public Brush LineColor { get; set; }
+        [Browsable(false)] public string LineColorSerialize { get { return Serialize.BrushToString(LineColor); } set { LineColor = Serialize.StringToBrush(value); } }
+
+        [NinjaScriptProperty]
+        [Display(Name="Line Style", Order=2, GroupName="2. Style")]
+        public DashStyleHelper LineStyle { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 5)]
+        [Display(Name="Line Width", Order=3, GroupName="2. Style")]
+        public int LineWidth { get; set; }
+
+        // --- LABELS ---
+        [NinjaScriptProperty]
+        [Display(Name="Show Labels", Order=1, GroupName="3. Labels")]
+        public bool ShowLabels { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(8, 24)]
+        [Display(Name="Text Size", Order=2, GroupName="3. Labels")]
+        public int LabelTextSize { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 200)]
+        [Display(Name="Offset (Bars Right)", Order=3, GroupName="3. Labels")]
+        public int LabelOffsetBars { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Text Color", Order=4, GroupName="3. Labels")]
+        public Brush LabelTextColor { get; set; }
+        [Browsable(false)] public string LabelTextColorSerialize { get { return Serialize.BrushToString(LabelTextColor); } set { LabelTextColor = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Background Color", Order=5, GroupName="3. Labels")]
+        public Brush LabelBgColor { get; set; }
+        [Browsable(false)] public string LabelBgColorSerialize { get { return Serialize.BrushToString(LabelBgColor); } set { LabelBgColor = Serialize.StringToBrush(value); } }
+
+        // --- INFO TABLE ---
+        [NinjaScriptProperty]
+        [Display(Name="Show Table", Order=1, GroupName="4. Info Table")]
+        public bool ShowTable { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name="Table Position", Order=2, GroupName="4. Info Table")]
+        public RipsTablePos TablePosition { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(8, 24)]
+        [Display(Name="Table Text Size", Order=3, GroupName="4. Info Table")]
+        public int TableTextSize { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Header Background", Order=4, GroupName="4. Info Table")]
+        public Brush TableHdrBg { get; set; }
+        [Browsable(false)] public string TableHdrBgSerialize { get { return Serialize.BrushToString(TableHdrBg); } set { TableHdrBg = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Header Text Color", Order=5, GroupName="4. Info Table")]
+        public Brush TableHdrText { get; set; }
+        [Browsable(false)] public string TableHdrTextSerialize { get { return Serialize.BrushToString(TableHdrText); } set { TableHdrText = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Cell Background", Order=6, GroupName="4. Info Table")]
+        public Brush TableBg { get; set; }
+        [Browsable(false)] public string TableBgSerialize { get { return Serialize.BrushToString(TableBg); } set { TableBg = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Cell Text Color", Order=7, GroupName="4. Info Table")]
+        public Brush TableText { get; set; }
+        [Browsable(false)] public string TableTextSerialize { get { return Serialize.BrushToString(TableText); } set { TableText = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore]
+        [Display(Name="Border Color", Order=8, GroupName="4. Info Table")]
+        public Brush TableBorder { get; set; }
+        [Browsable(false)] public string TableBorderSerialize { get { return Serialize.BrushToString(TableBorder); } set { TableBorder = Serialize.StringToBrush(value); } }
+
+        #endregion
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private RipsLevels[] cacheRipsLevels;
+		public RipsLevels RipsLevels(int buttonXOffset, int buttonYOffset, RipsMode detectMode, string esLevelsStr, string nqLevelsStr, DashStyleHelper lineStyle, int lineWidth, bool showLabels, int labelTextSize, int labelOffsetBars, bool showTable, RipsTablePos tablePosition, int tableTextSize)
+		{
+			return RipsLevels(Input, buttonXOffset, buttonYOffset, detectMode, esLevelsStr, nqLevelsStr, lineStyle, lineWidth, showLabels, labelTextSize, labelOffsetBars, showTable, tablePosition, tableTextSize);
+		}
+
+		public RipsLevels RipsLevels(ISeries<double> input, int buttonXOffset, int buttonYOffset, RipsMode detectMode, string esLevelsStr, string nqLevelsStr, DashStyleHelper lineStyle, int lineWidth, bool showLabels, int labelTextSize, int labelOffsetBars, bool showTable, RipsTablePos tablePosition, int tableTextSize)
+		{
+			if (cacheRipsLevels != null)
+				for (int idx = 0; idx < cacheRipsLevels.Length; idx++)
+					if (cacheRipsLevels[idx] != null && cacheRipsLevels[idx].ButtonXOffset == buttonXOffset && cacheRipsLevels[idx].ButtonYOffset == buttonYOffset && cacheRipsLevels[idx].DetectMode == detectMode && cacheRipsLevels[idx].EsLevelsStr == esLevelsStr && cacheRipsLevels[idx].NqLevelsStr == nqLevelsStr && cacheRipsLevels[idx].LineStyle == lineStyle && cacheRipsLevels[idx].LineWidth == lineWidth && cacheRipsLevels[idx].ShowLabels == showLabels && cacheRipsLevels[idx].LabelTextSize == labelTextSize && cacheRipsLevels[idx].LabelOffsetBars == labelOffsetBars && cacheRipsLevels[idx].ShowTable == showTable && cacheRipsLevels[idx].TablePosition == tablePosition && cacheRipsLevels[idx].TableTextSize == tableTextSize && cacheRipsLevels[idx].EqualsInput(input))
+						return cacheRipsLevels[idx];
+			return CacheIndicator<RipsLevels>(new RipsLevels(){ ButtonXOffset = buttonXOffset, ButtonYOffset = buttonYOffset, DetectMode = detectMode, EsLevelsStr = esLevelsStr, NqLevelsStr = nqLevelsStr, LineStyle = lineStyle, LineWidth = lineWidth, ShowLabels = showLabels, LabelTextSize = labelTextSize, LabelOffsetBars = labelOffsetBars, ShowTable = showTable, TablePosition = tablePosition, TableTextSize = tableTextSize }, input, ref cacheRipsLevels);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.RipsLevels RipsLevels(int buttonXOffset, int buttonYOffset, RipsMode detectMode, string esLevelsStr, string nqLevelsStr, DashStyleHelper lineStyle, int lineWidth, bool showLabels, int labelTextSize, int labelOffsetBars, bool showTable, RipsTablePos tablePosition, int tableTextSize)
+		{
+			return indicator.RipsLevels(Input, buttonXOffset, buttonYOffset, detectMode, esLevelsStr, nqLevelsStr, lineStyle, lineWidth, showLabels, labelTextSize, labelOffsetBars, showTable, tablePosition, tableTextSize);
+		}
+
+		public Indicators.RipsLevels RipsLevels(ISeries<double> input , int buttonXOffset, int buttonYOffset, RipsMode detectMode, string esLevelsStr, string nqLevelsStr, DashStyleHelper lineStyle, int lineWidth, bool showLabels, int labelTextSize, int labelOffsetBars, bool showTable, RipsTablePos tablePosition, int tableTextSize)
+		{
+			return indicator.RipsLevels(input, buttonXOffset, buttonYOffset, detectMode, esLevelsStr, nqLevelsStr, lineStyle, lineWidth, showLabels, labelTextSize, labelOffsetBars, showTable, tablePosition, tableTextSize);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.RipsLevels RipsLevels(int buttonXOffset, int buttonYOffset, RipsMode detectMode, string esLevelsStr, string nqLevelsStr, DashStyleHelper lineStyle, int lineWidth, bool showLabels, int labelTextSize, int labelOffsetBars, bool showTable, RipsTablePos tablePosition, int tableTextSize)
+		{
+			return indicator.RipsLevels(Input, buttonXOffset, buttonYOffset, detectMode, esLevelsStr, nqLevelsStr, lineStyle, lineWidth, showLabels, labelTextSize, labelOffsetBars, showTable, tablePosition, tableTextSize);
+		}
+
+		public Indicators.RipsLevels RipsLevels(ISeries<double> input , int buttonXOffset, int buttonYOffset, RipsMode detectMode, string esLevelsStr, string nqLevelsStr, DashStyleHelper lineStyle, int lineWidth, bool showLabels, int labelTextSize, int labelOffsetBars, bool showTable, RipsTablePos tablePosition, int tableTextSize)
+		{
+			return indicator.RipsLevels(input, buttonXOffset, buttonYOffset, detectMode, esLevelsStr, nqLevelsStr, lineStyle, lineWidth, showLabels, labelTextSize, labelOffsetBars, showTable, tablePosition, tableTextSize);
+		}
+	}
+}
+
+#endregion
