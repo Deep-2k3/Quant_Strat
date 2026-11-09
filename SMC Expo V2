@@ -1,0 +1,279 @@
+//@version=6
+strategy("SMC Precision Flow v3.1", shorttitle="SMC Precision v3.1", overlay=true, initial_capital=150000, default_qty_type=strategy.cash, max_labels_count=500, max_lines_count=500, calc_on_every_tick=true)
+
+// ==============================================================================
+// ~~ 1. INPUTS & SETTINGS
+// ==============================================================================
+grp_smc = "SMC Structure Settings"
+prd     = input.int(15, "Structure Period", group=grp_smc, tooltip="15 is optimal for 1-min charts.")
+resp    = input.int(7, "Structure Response", group=grp_smc, tooltip="Stability check for SMS/BMS.")
+bullCol = input.color(color.rgb(8, 236, 126), "Bullish Color", group=grp_smc)
+bearCol = input.color(color.rgb(255, 34, 34), "Bearish Color", group=grp_smc)
+
+grp_trade = "Trade Execution Settings"
+max_risk  = input.float(500.0, "Max Risk Per Trade ($)", step=50.0, group=grp_trade)
+sl_buffer = input.float(1.0, "Stop Loss Buffer (Points)", step=0.5, group=grp_trade)
+min_zone  = input.float(1.5, "Minimum Zone Size (Points)", step=0.5, group=grp_trade)
+rr_target = input.float(2.0, "Final Risk:Reward Target", step=0.1, group=grp_trade, tooltip="Dynamic multiplier. 2.0 = 1:2 RR.")
+entry_pct = input.float(0.618, "Entry Retracement % (OTE)", step=0.05, group=grp_trade, tooltip="0.5 = EQ. 0.618 or 0.786 = Optimal Trade Entry.")
+
+grp_partials = "Partial Take Profits"
+use_partials = input.bool(true, "Take Partial Profits?", group=grp_partials)
+partial_pct  = input.int(50, "Partial Size (%)", minval=10, maxval=90, step=10, group=grp_partials)
+partial_rr   = input.float(1.0, "Partial Target (R-Multiple)", step=0.5, group=grp_partials, tooltip="Takes partials at 1R.")
+
+grp_be = "Trade Management (Breakeven)"
+use_be     = input.bool(true, "Use Breakeven", group=grp_be, tooltip="Moves SL to entry when price nears target.")
+be_trigger = input.float(0.85, "Breakeven Trigger (R-Multiple)", step=0.05, group=grp_be, tooltip="Trigger BE just before TP1 hits.")
+
+grp_risk = "Account Risk Management"
+max_daily_loss = input.float(1000.0, "Max Daily Loss ($)", step=100.0, group=grp_risk, tooltip="Shuts off the bot for the day if this loss is hit.")
+
+grp_vol = "Volatility & Chop Filters"
+use_atr = input.bool(true, "Use Minimum ATR Filter", group=grp_vol, tooltip="Prevents trading in dead, tight-ranging markets.")
+atr_len = input.int(14, "ATR Length", group=grp_vol)
+min_atr = input.float(0.4, "Minimum ATR (Points)", step=0.1, group=grp_vol, tooltip="Minimum average candle size required to trade. Hover over chop in the Data Window to find the right number.")
+
+grp_chop = "Trend Direction Filters"
+use_adx    = input.bool(true, "Use ADX Trend Filter", group=grp_chop)
+adx_len    = input.int(14, "ADX Length", group=grp_chop)
+adx_thresh = input.float(15.0, "ADX Threshold", group=grp_chop)
+
+grp_ema = "HTF EMA Trend Filter"
+use_ema    = input.bool(true, "Use HTF EMA Filter", group=grp_ema, tooltip="Aligns trades with the macro trend.")
+ema_tf     = input.timeframe("15", "Higher Timeframe", group=grp_ema)
+ema_len    = input.int(200, "EMA Length", group=grp_ema)
+
+grp_time = "Time & News Filters"
+use_active  = input.bool(true, "Use Active Trading Window", group=grp_time)
+active_sess = input.session("0000-1400", "Active Trading Hours", group=grp_time)
+use_lunch   = input.bool(true, "Block Lunch Hour Chop?", group=grp_time)
+lunch_sess  = input.session("1200-1345", "Lunch Hours (No Trading)", group=grp_time)
+tz          = input.string("America/New_York", "Timezone", group=grp_time)
+
+// ==============================================================================
+// ~~ 2. ACCOUNT RISK LIMITS
+// ==============================================================================
+strategy.risk.max_intraday_loss(max_daily_loss, strategy.cash)
+
+// ==============================================================================
+// ~~ 3. FILTER LOGIC
+// ==============================================================================
+atr_val = ta.atr(atr_len)
+has_volatility = not use_atr or (atr_val >= min_atr)
+
+[diplus, diminus, adx] = ta.dmi(adx_len, adx_len)
+is_trending = not use_adx or (adx >= adx_thresh)
+
+ema_val = request.security(syminfo.tickerid, ema_tf, ta.ema(close, ema_len), gaps=barmerge.gaps_on)
+ema_long  = not use_ema or (close > nz(ema_val, close))
+ema_short = not use_ema or (close < nz(ema_val, close))
+
+in_active_window = not use_active or not na(time(timeframe.period, active_sess, tz))
+in_lunch_window  = use_lunch and not na(time(timeframe.period, lunch_sess, tz))
+can_trade        = in_active_window and not in_lunch_window
+
+// ==============================================================================
+// ~~ 4. SMC STRUCTURE TRACKING (INDICATOR ENGINE)
+// ==============================================================================
+var float Up  = na
+var float Dn  = na
+var int iUp   = na
+var int iDn   = na
+var int pos   = 0
+
+Up := math.max(nz(Up[1], high), high)
+Dn := math.min(nz(Dn[1], low), low)
+
+pvtHi = ta.pivothigh(high, prd, prd)
+pvtLo = ta.pivotlow(low, prd, prd)
+
+if not na(pvtHi)
+    Up := pvtHi
+if not na(pvtLo)
+    Dn := pvtLo
+
+bool is_bull_break = Up > nz(Up[1])
+bool is_bear_break = Dn < nz(Dn[1])
+bool stable_high   = nz(Up[1]) == nz(Up[resp])
+bool stable_low    = nz(Dn[1]) == nz(Dn[resp])
+
+if is_bull_break
+    iUp := bar_index
+    if pos <= 0
+        pos := 1
+        label.new(nz(iUp[1], bar_index), Up[1], "CHoCH", color=color(na), textcolor=bullCol, style=label.style_label_down)
+        line.new(nz(iUp[1], bar_index), Up[1], bar_index, Up[1], color=bullCol, style=line.style_dashed)
+    else if pos == 1 and stable_high
+        pos := 2
+        label.new(nz(iUp[1], bar_index), Up[1], "SMS", color=color(na), textcolor=bullCol, style=label.style_label_down)
+        line.new(nz(iUp[1], bar_index), Up[1], bar_index, Up[1], color=bullCol, style=line.style_dashed)
+    else if pos > 1 and stable_high
+        pos := pos + 1
+        label.new(nz(iUp[1], bar_index), Up[1], "BMS", color=color(na), textcolor=bullCol, style=label.style_label_down)
+        line.new(nz(iUp[1], bar_index), Up[1], bar_index, Up[1], color=bullCol, style=line.style_dashed)
+else if Up < nz(Up[1])
+    iUp := bar_index - prd
+
+if is_bear_break
+    iDn := bar_index
+    if pos >= 0
+        pos := -1
+        label.new(nz(iDn[1], bar_index), Dn[1], "CHoCH", color=color(na), textcolor=bearCol, style=label.style_label_up)
+        line.new(nz(iDn[1], bar_index), Dn[1], bar_index, Dn[1], color=bearCol, style=line.style_dashed)
+    else if pos == -1 and stable_low
+        pos := -2
+        label.new(nz(iDn[1], bar_index), Dn[1], "SMS", color=color(na), textcolor=bearCol, style=label.style_label_up)
+        line.new(nz(iDn[1], bar_index), Dn[1], bar_index, Dn[1], color=bearCol, style=line.style_dashed)
+    else if pos < -1 and stable_low
+        pos := pos - 1
+        label.new(nz(iDn[1], bar_index), Dn[1], "BMS", color=color(na), textcolor=bearCol, style=label.style_label_up)
+        line.new(nz(iDn[1], bar_index), Dn[1], bar_index, Dn[1], color=bearCol, style=line.style_dashed)
+else if Dn > nz(Dn[1])
+    iDn := bar_index - prd
+
+// ==============================================================================
+// ~~ 5. CORE EXECUTION MATH & GHOST TP ENGINE
+// ==============================================================================
+var float last_traded_Up = na
+var float last_traded_Dn = na
+var bool  zone_burned    = false
+var bool  ghost_tp_armed = false
+
+if not na(Up) and not na(Dn)
+    if strategy.position_size == 0
+        if na(last_traded_Up) or (Up != last_traded_Up) or (Dn != last_traded_Dn)
+            last_traded_Up := Up
+            last_traded_Dn := Dn
+            zone_burned    := false
+            ghost_tp_armed := false
+            strategy.cancel_all()
+    else
+        last_traded_Up := Up
+        last_traded_Dn := Dn
+
+    float zone_size = Up - Dn
+    float entry_price_long  = Up - (zone_size * entry_pct) 
+    float entry_price_short = Dn + (zone_size * entry_pct) 
+
+    float long_sl  = Dn - sl_buffer
+    float short_sl = Up + sl_buffer
+    
+    float long_tp1  = entry_price_long + ((entry_price_long - long_sl) * partial_rr)
+    float short_tp1 = entry_price_short - ((short_sl - entry_price_short) * partial_rr)
+
+    float long_tp2  = entry_price_long + ((entry_price_long - long_sl) * rr_target) 
+    float short_tp2 = entry_price_short - ((short_sl - entry_price_short) * rr_target) 
+
+    float long_qty  = math.floor(max_risk / ((entry_price_long - long_sl) * syminfo.pointvalue))
+    float short_qty = math.floor(max_risk / ((short_sl - entry_price_short) * syminfo.pointvalue))
+    long_qty  := math.min(long_qty, 100) 
+    short_qty := math.min(short_qty, 100)
+
+    if pos >= 2 and low <= entry_price_long
+        ghost_tp_armed := true
+    if pos <= -2 and high >= entry_price_short
+        ghost_tp_armed := true
+
+    if not zone_burned and strategy.position_size == 0 and ghost_tp_armed
+        if pos >= 2 and high >= long_tp2
+            strategy.cancel("Long")
+            zone_burned := true
+        if pos <= -2 and low <= short_tp2
+            strategy.cancel("Short")
+            zone_burned := true
+
+    // ==============================================================================
+    // ~~ 6. ORDER EXECUTION 
+    // ==============================================================================
+    bool matured_trend   = math.abs(pos) >= 2
+    bool valid_zone_size = zone_size >= min_zone
+
+    if not zone_burned and strategy.position_size == 0 and can_trade and valid_zone_size and is_trending and matured_trend and has_volatility
+        
+        if pos >= 2 and long_qty > 0 and ema_long
+            strategy.entry("Long", strategy.long, qty=long_qty, limit=entry_price_long)
+            if use_partials
+                strategy.exit("TP1", "Long", qty_percent=partial_pct, stop=long_sl, limit=long_tp1)
+                strategy.exit("Final", "Long", stop=long_sl, limit=long_tp2)
+            else
+                strategy.exit("Exit Long", "Long", stop=long_sl, limit=long_tp2)
+                
+        else if pos <= -2 and short_qty > 0 and ema_short
+            strategy.entry("Short", strategy.short, qty=short_qty, limit=entry_price_short)
+            if use_partials
+                strategy.exit("TP1", "Short", qty_percent=partial_pct, stop=short_sl, limit=short_tp1)
+                strategy.exit("Final", "Short", stop=short_sl, limit=short_tp2)
+            else
+                strategy.exit("Exit Short", "Short", stop=short_sl, limit=short_tp2)
+
+    // ==============================================================================
+    // ~~ 7. BREAKEVEN MANAGEMENT
+    // ==============================================================================
+    var float active_sl_long = na
+    var float active_sl_short = na
+    
+    if strategy.position_size > 0
+        if strategy.position_size[1] <= 0
+            active_sl_long := long_sl
+        float be_target = entry_price_long + ((entry_price_long - long_sl) * be_trigger)
+        if use_be and high >= be_target
+            active_sl_long := entry_price_long
+        if use_partials
+            strategy.exit("TP1", "Long", qty_percent=partial_pct, stop=active_sl_long, limit=long_tp1)
+            strategy.exit("Final", "Long", stop=active_sl_long, limit=long_tp2)
+        else
+            strategy.exit("Exit Long", "Long", stop=active_sl_long, limit=long_tp2)
+    else
+        active_sl_long := na
+
+    if strategy.position_size < 0
+        if strategy.position_size[1] >= 0
+            active_sl_short := short_sl
+        float be_target = entry_price_short - ((short_sl - entry_price_short) * be_trigger)
+        if use_be and low <= be_target
+            active_sl_short := entry_price_short
+        if use_partials
+            strategy.exit("TP1", "Short", qty_percent=partial_pct, stop=active_sl_short, limit=short_tp1)
+            strategy.exit("Final", "Short", stop=active_sl_short, limit=short_tp2)
+        else
+            strategy.exit("Exit Short", "Short", stop=active_sl_short, limit=short_tp2)
+    else
+        active_sl_short := na
+
+    if strategy.position_size != 0
+        zone_burned := true
+
+// ==============================================================================
+// ~~ 8. VISUALS & DATA OUTPUT
+// ==============================================================================
+plot(use_ema ? ema_val : na, "HTF EMA Filter", color=color.new(color.blue, 30), linewidth=2)
+
+// Output the ATR value to the Data Window so we can calibrate the filter
+plot(atr_val, "Current ATR (Calibration)", color=color.new(color.purple, 100), display=display.data_window)
+
+var premium_box  = box.new(na, na, na, na, bgcolor=color.new(color.red, 80), border_color=color.new(color.white, 100))
+var discount_box = box.new(na, na, na, na, bgcolor=color.new(color.green, 80), border_color=color.new(color.white, 100))
+var mid_box      = box.new(na, na, na, na, bgcolor=color.new(color.gray, 80), border_color=color.new(color.white, 100))
+
+if barstate.islast and not na(Up) and not na(Dn)
+    float zone_size = Up - Dn
+    int anchor = math.min(nz(iUp, bar_index-prd), nz(iDn, bar_index-prd))
+    
+    box.set_lefttop(premium_box, anchor, Up - (zone_size * 0.1))
+    box.set_rightbottom(premium_box, bar_index, Up - (zone_size * 0.25))
+    
+    box.set_lefttop(mid_box, anchor, Up - (zone_size * 0.45))
+    box.set_rightbottom(mid_box, bar_index, Dn + (zone_size * 0.45))
+    
+    box.set_lefttop(discount_box, anchor, Dn + (zone_size * 0.25))
+    box.set_rightbottom(discount_box, bar_index, Dn + (zone_size * 0.1))
+
+var table dash = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 40), frame_color=color.gray, frame_width=1, border_color=color.gray, border_width=1)
+if barstate.islast
+    int w = strategy.wintrades
+    int l = strategy.losstrades
+    float wr = (w + l) > 0 ? (float(w) / float(w + l)) * 100.0 : 0.0
+    table.cell(dash, 0, 0, "WIN: " + str.tostring(w), text_color=color.green, text_halign=text.align_center)
+    table.cell(dash, 0, 1, "LOSS: " + str.tostring(l), text_color=color.red, text_halign=text.align_center)
+    table.cell(dash, 0, 2, "Profitability: " + str.tostring(wr, "#.##") + "%", text_color=color.white, text_halign=text.align_center)
