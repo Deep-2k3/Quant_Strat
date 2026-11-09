@@ -1,0 +1,460 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls; // Required for WPF Button
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using System.Windows.Threading; // Required for the safe background timer
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class RiskAssistant : Indicator
+    {
+        private Line entryLine;
+        private Line stopLine;
+        
+        // Variables to track movement for "Group Move" and instant UI refreshing
+        private double lastEntryPrice = -1; 
+        private double lastKnownStopPrice = -1;
+
+        // Static Memory to save lines across timeframe changes
+        private static Dictionary<string, double> EntryCache = new Dictionary<string, double>();
+        private static Dictionary<string, double> StopCache = new Dictionary<string, double>();
+
+        // UI & Toggle State
+        private Button toggleButton;
+        private Border buttonContainer; 
+        private DispatcherTimer updateTimer;
+        private bool isToolActive = true;
+
+        // Fonts
+        private SimpleFont fontMain;
+        private SimpleFont fontSmall;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "Risk Tool with Group Move, Memory, and ON/OFF Toggle";
+                Name = "RiskAssistant";
+                Calculate = Calculate.OnPriceChange;
+                IsOverlay = true;
+                DisplayInDataBox = false;
+                PaintPriceMarkers = false;
+
+                RiskAmount = 500;
+                DefaultStopDistance = 20; // Default 20 points
+                TextColor = Brushes.White; // Visible on Dark Charts
+            }
+            else if (State == State.DataLoaded)
+            {
+                // Initialize fonts safely here
+                fontMain = new SimpleFont("Arial", 12) { Bold = true };
+                fontSmall = new SimpleFont("Arial", 11) { Bold = true };
+            }
+            else if (State == State.Historical)
+            {
+                // Safely add the WPF button and start the sync timer
+                if (ChartControl != null)
+                {
+                    ChartControl.Dispatcher.InvokeAsync(() =>
+                    {
+                        CreateWPFControls();
+
+                        // Create a fast heartbeat timer (50ms) to sync dragged lines smoothly
+                        if (updateTimer == null)
+                        {
+                            updateTimer = new DispatcherTimer();
+                            updateTimer.Interval = TimeSpan.FromMilliseconds(50);
+                            updateTimer.Tick += UpdateTimer_Tick;
+                            updateTimer.Start();
+                        }
+                    });
+                }
+            }
+            else if (State == State.Terminated)
+            {
+                // Clean up WPF button and timer when indicator is removed
+                if (ChartControl != null)
+                {
+                    ChartControl.Dispatcher.InvokeAsync(() =>
+                    {
+                        DisposeWPFControls();
+                        
+                        if (updateTimer != null)
+                        {
+                            updateTimer.Stop();
+                            updateTimer = null;
+                        }
+                    });
+                }
+            }
+        }
+
+        #region WPF UI Button Setup
+        private void CreateWPFControls()
+        {
+            if (buttonContainer != null) return;
+
+            // 1. Create the inner green button (PPG Style)
+            toggleButton = new Button()
+            {
+                Content = "ON",
+                Background = Brushes.LimeGreen,
+                Foreground = Brushes.White,
+                FontWeight = FontWeights.Bold,
+                FontSize = 13,
+                BorderBrush = Brushes.Transparent, 
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(15, 6, 15, 6),
+                Cursor = Cursors.Arrow,
+                Focusable = false // Prevents button from stealing keyboard focus from chart
+            };
+
+            toggleButton.Click += ToggleButton_Click;
+
+            // 2. Wrap it in a PPG-style dark container border
+            buttonContainer = new Border()
+            {
+                Background = new SolidColorBrush(Color.FromArgb(220, 50, 50, 50)), // PPG Dark gray
+                BorderBrush = new SolidColorBrush(Color.FromArgb(255, 90, 90, 90)), // PPG Subtle border
+                BorderThickness = new Thickness(1.5),
+                CornerRadius = new CornerRadius(4), // Rounded edges
+                Padding = new Thickness(3), 
+                Margin = new Thickness(10, 25, 0, 0), // Clears the standard text at top-left
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                Child = toggleButton
+            };
+
+            // Force the container to render on top of chart drawing elements
+            System.Windows.Controls.Panel.SetZIndex(buttonContainer, 99999); 
+            
+            // CRITICAL FIX FOR VANISHING CANDLES & CS1061 ERROR:
+            // Add the button to the main ChartControl (which is a Grid)
+            // BUT explicitly assign it to the exact Row and Column where the ChartPanel lives.
+            // This prevents the button from creating a new column and crushing the candles.
+            if (ChartPanel != null)
+            {
+                System.Windows.Controls.Grid.SetRow(buttonContainer, System.Windows.Controls.Grid.GetRow(ChartPanel));
+                System.Windows.Controls.Grid.SetColumn(buttonContainer, System.Windows.Controls.Grid.GetColumn(ChartPanel));
+            }
+
+            ChartControl.Children.Add(buttonContainer);
+        }
+
+        private void DisposeWPFControls()
+        {
+            if (buttonContainer != null)
+            {
+                if (toggleButton != null)
+                    toggleButton.Click -= ToggleButton_Click;
+                    
+                ChartControl.Children.Remove(buttonContainer);
+                buttonContainer = null;
+                toggleButton = null;
+            }
+        }
+
+        private void ToggleButton_Click(object sender, RoutedEventArgs e)
+        {
+            isToolActive = !isToolActive;
+            
+            if (isToolActive)
+            {
+                toggleButton.Content = "ON";
+                toggleButton.Background = Brushes.LimeGreen;
+                
+                // Clear memory so it spawns fresh at current price
+                string instr = Instrument.FullName;
+                EntryCache.Remove(instr);
+                StopCache.Remove(instr);
+
+                EnsureLinesExist();
+                UpdateAnalysis();
+            }
+            else
+            {
+                toggleButton.Content = "OFF";
+                toggleButton.Background = Brushes.DimGray;
+                RemoveDrawObjects();
+            }
+            
+            ForceRefresh(); // Instantly update the chart visuals
+        }
+        #endregion
+
+        protected override void OnBarUpdate()
+        {
+            // Handled by DispatcherTimer to keep UI smooth and prevent lag
+        }
+
+        private void UpdateTimer_Tick(object sender, EventArgs e)
+        {
+            if (!isToolActive) return;
+
+            EnsureLinesExist();
+            UpdateAnalysis();
+        }
+
+        private void EnsureLinesExist()
+        {
+            if (Bars == null || Bars.Count == 0) return;
+
+            string instr = Instrument.FullName;
+            double currentPrice = Bars.GetClose(Bars.Count - 1);
+
+            if (GetLine("RR_Entry") == null)
+            {
+                double priceToUse = EntryCache.ContainsKey(instr) ? EntryCache[instr] : currentPrice; 
+                CreateDraggableLine("RR_Entry", priceToUse, Brushes.Navy, DashStyleHelper.Dash);
+                lastEntryPrice = priceToUse; 
+            }
+
+            if (GetLine("RR_Stop") == null)
+            {
+                double priceToUse = StopCache.ContainsKey(instr) ? StopCache[instr] : (currentPrice - DefaultStopDistance);
+                CreateDraggableLine("RR_Stop", priceToUse, Brushes.DarkMagenta, DashStyleHelper.Solid);
+            }
+        }
+
+        private void CreateDraggableLine(string tag, double price, Brush brush, DashStyleHelper style)
+        {
+            if (Bars == null || Bars.Count == 0) return;
+            
+            int currBarIdx = Bars.Count - 1;
+            int startIdx = Math.Max(0, currBarIdx - 10); 
+            
+            DateTime startTime = Bars.GetTime(startIdx);
+            
+            // Use strict timeframe duration to safely extend into future
+            TimeSpan barDuration = TimeSpan.FromMinutes(1); // Default
+            if (BarsPeriod.BarsPeriodType == BarsPeriodType.Minute) barDuration = TimeSpan.FromMinutes(BarsPeriod.Value);
+            else if (BarsPeriod.BarsPeriodType == BarsPeriodType.Second) barDuration = TimeSpan.FromSeconds(BarsPeriod.Value);
+            else if (BarsPeriod.BarsPeriodType == BarsPeriodType.Day) barDuration = TimeSpan.FromDays(BarsPeriod.Value);
+
+            DateTime endTime = Bars.GetTime(currBarIdx).Add(TimeSpan.FromTicks(barDuration.Ticks * 15)); 
+            
+            var l = Draw.Line(this, tag, false, startTime, price, endTime, price, brush, style, 3);
+            l.IsLocked = false; 
+        }
+
+        private void RemoveDrawObjects()
+        {
+            RemoveDrawObject("RR_Entry");
+            RemoveDrawObject("RR_Stop");
+            RemoveDrawObject("RR_Target1");
+            RemoveDrawObject("RR_Target2");
+            RemoveDrawObject("Txt_Main");
+            RemoveDrawObject("Txt_Stop");
+            RemoveDrawObject("Txt_T1");
+            RemoveDrawObject("Txt_T2");
+        }
+
+        private void UpdateAnalysis()
+        {
+            entryLine = GetLine("RR_Entry");
+            stopLine = GetLine("RR_Stop");
+
+            if (entryLine == null || stopLine == null) return;
+            
+            entryLine.IsLocked = false;
+            stopLine.IsLocked = false;
+
+            string instr = Instrument.FullName;
+            double currentEntryPrice = entryLine.StartAnchor.Price;
+            bool layoutChanged = false;
+
+            double epsilon = 0.000001; 
+
+            // --- 2. GROUP MOVEMENT ---
+            if (lastEntryPrice != -1 && Math.Abs(currentEntryPrice - lastEntryPrice) > epsilon)
+            {
+                double change = currentEntryPrice - lastEntryPrice;
+                stopLine.StartAnchor.Price += change;
+                stopLine.EndAnchor.Price += change;
+                layoutChanged = true;
+            }
+
+            // Check if stop moved independently
+            if (Math.Abs(stopLine.StartAnchor.Price - lastKnownStopPrice) > epsilon)
+            {
+                layoutChanged = true;
+            }
+
+            lastEntryPrice = currentEntryPrice;
+            lastKnownStopPrice = stopLine.StartAnchor.Price;
+
+            // --- 3. VERTICAL SYNC ---
+            if (stopLine.StartAnchor.Time != entryLine.StartAnchor.Time || stopLine.EndAnchor.Time != entryLine.EndAnchor.Time)
+            {
+                stopLine.StartAnchor.Time = entryLine.StartAnchor.Time;
+                stopLine.EndAnchor.Time = entryLine.EndAnchor.Time;
+                layoutChanged = true;
+            }
+
+            // Auto-Flatten
+            if (Math.Abs(entryLine.EndAnchor.Price - entryLine.StartAnchor.Price) > epsilon || 
+                Math.Abs(stopLine.EndAnchor.Price - stopLine.StartAnchor.Price) > epsilon)
+            {
+                entryLine.EndAnchor.Price = entryLine.StartAnchor.Price;
+                stopLine.EndAnchor.Price = stopLine.StartAnchor.Price;
+                layoutChanged = true;
+            }
+
+            // --- 4. SAVE TO MEMORY ---
+            if (EntryCache.ContainsKey(instr)) EntryCache[instr] = entryLine.StartAnchor.Price;
+            else EntryCache.Add(instr, entryLine.StartAnchor.Price);
+
+            if (StopCache.ContainsKey(instr)) StopCache[instr] = stopLine.StartAnchor.Price;
+            else StopCache.Add(instr, stopLine.StartAnchor.Price);
+
+            // --- 5. CALCULATIONS ---
+            double entryPrice = entryLine.StartAnchor.Price;
+            double stopPrice = stopLine.StartAnchor.Price;
+            double diff = entryPrice - stopPrice; 
+            double riskDist = Math.Abs(diff);
+            
+            if (riskDist < TickSize) riskDist = TickSize;
+
+            double pointValue = Instrument.MasterInstrument.PointValue;
+            double riskPerOne = riskDist * pointValue;
+            if (riskPerOne <= 0) riskPerOne = 1; 
+
+            int qty = (int)(RiskAmount / riskPerOne);
+            if (qty < 1) qty = 1;
+
+            double points = riskDist; 
+
+            // --- 6. TARGETS ---
+            double target1Price = entryPrice + diff; 
+            double target2Price = entryPrice + (diff * 2);
+
+            Draw.Line(this, "RR_Target1", false, entryLine.StartAnchor.Time, target1Price, entryLine.EndAnchor.Time, target1Price, Brushes.Green, DashStyleHelper.Dot, 2);
+            Draw.Line(this, "RR_Target2", false, entryLine.StartAnchor.Time, target2Price, entryLine.EndAnchor.Time, target2Price, Brushes.Green, DashStyleHelper.Dot, 2);
+
+            // --- 7. TEXT LABELS ---
+            double midRiskPrice = (entryPrice + stopPrice) / 2;
+            string mainLabel = string.Format("RISK: ${0}  |  QTY: {1}  |  DIST: {2:0.00} pts", RiskAmount, qty, points);
+
+            DateTime textAnchorTime = Bars.GetTime(Math.Max(0, Bars.Count - 1));
+
+            Draw.Text(this, "Txt_Main", false, mainLabel, textAnchorTime, midRiskPrice, 0, 
+                TextColor, fontMain, TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
+
+            Draw.Text(this, "Txt_Stop", false, stopPrice.ToString("N2"), textAnchorTime, stopPrice, 20, 
+                Brushes.DarkMagenta, fontSmall, TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
+
+            string t1Label = string.Format("Target 1: {0:N2} ({1:0.00} pts)", target1Price, points);
+            Draw.Text(this, "Txt_T1", false, t1Label, textAnchorTime, target1Price, -20, 
+                Brushes.Green, fontSmall, TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
+
+            string t2Label = string.Format("Target 2: {0:N2} ({1:0.00} pts)", target2Price, points * 2);
+            Draw.Text(this, "Txt_T2", false, t2Label, textAnchorTime, target2Price, -20, 
+                Brushes.Green, fontSmall, TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
+
+            // If any line was dragged, instantly force the chart to refresh the texts
+            if (layoutChanged)
+            {
+                ChartControl?.Dispatcher.InvokeAsync(() => { ForceRefresh(); });
+            }
+        }
+
+        private Line GetLine(string tag)
+        {
+            foreach (DrawingTool dt in DrawObjects)
+            {
+                if (dt.Tag == tag && dt is Line) return dt as Line;
+            }
+            return null;
+        }
+
+        #region Properties
+        [NinjaScriptProperty]
+        [Range(1, double.MaxValue)]
+        [Display(Name="Risk Amount ($)", GroupName="Parameters")]
+        public double RiskAmount { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, double.MaxValue)]
+        [Display(Name="Default Stop (Points)", GroupName="Parameters")]
+        public double DefaultStopDistance { get; set; }
+
+        [XmlIgnore]
+        [Display(Name="Text Color", GroupName="Visual")]
+        public Brush TextColor { get; set; }
+        #endregion
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private RiskAssistant[] cacheRiskAssistant;
+		public RiskAssistant RiskAssistant(double riskAmount, double defaultStopDistance)
+		{
+			return RiskAssistant(Input, riskAmount, defaultStopDistance);
+		}
+
+		public RiskAssistant RiskAssistant(ISeries<double> input, double riskAmount, double defaultStopDistance)
+		{
+			if (cacheRiskAssistant != null)
+				for (int idx = 0; idx < cacheRiskAssistant.Length; idx++)
+					if (cacheRiskAssistant[idx] != null && cacheRiskAssistant[idx].RiskAmount == riskAmount && cacheRiskAssistant[idx].DefaultStopDistance == defaultStopDistance && cacheRiskAssistant[idx].EqualsInput(input))
+						return cacheRiskAssistant[idx];
+			return CacheIndicator<RiskAssistant>(new RiskAssistant(){ RiskAmount = riskAmount, DefaultStopDistance = defaultStopDistance }, input, ref cacheRiskAssistant);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.RiskAssistant RiskAssistant(double riskAmount, double defaultStopDistance)
+		{
+			return indicator.RiskAssistant(Input, riskAmount, defaultStopDistance);
+		}
+
+		public Indicators.RiskAssistant RiskAssistant(ISeries<double> input , double riskAmount, double defaultStopDistance)
+		{
+			return indicator.RiskAssistant(input, riskAmount, defaultStopDistance);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.RiskAssistant RiskAssistant(double riskAmount, double defaultStopDistance)
+		{
+			return indicator.RiskAssistant(Input, riskAmount, defaultStopDistance);
+		}
+
+		public Indicators.RiskAssistant RiskAssistant(ISeries<double> input , double riskAmount, double defaultStopDistance)
+		{
+			return indicator.RiskAssistant(input, riskAmount, defaultStopDistance);
+		}
+	}
+}
+
+#endregion
