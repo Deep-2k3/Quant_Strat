@@ -1,0 +1,179 @@
+//@version=6
+indicator("Black Box Continuation [Risk Filtered]", overlay=true, max_boxes_count=100, max_labels_count=100)
+
+// =========================================================================
+// 1. INPUTS & PARAMETERS
+// =========================================================================
+grp_pivot = "Structural Pivots"
+leftBars  = input.int(15, title="Pivot Left Bars", minval=1, group=grp_pivot)
+rightBars = input.int(15, title="Pivot Right Bars", minval=1, group=grp_pivot)
+
+grp_logic = "Black Box Rules (Timeouts)"
+maxFakeoutBars = input.int(4, title="Max Bars for Fakeout", minval=1, group=grp_logic)
+maxWaitBars    = input.int(8, title="Max Bars to Wait for 2nd Crossing", minval=1, group=grp_logic)
+
+grp_bait = "Bait Depth Validation (Avoid Chop)"
+useAtrBait   = input.bool(true, title="Require Minimum Bait Depth", group=grp_bait)
+atrBaitMult  = input.float(0.4, title="Bait Depth (ATR Multiplier)", step=0.1, group=grp_bait)
+
+grp_filters = "Institutional Filters"
+useEmaFilter = input.bool(true, title="Require Macro Trend Alignment (EMA)", group=grp_filters)
+emaLength    = input.int(200, title="EMA Length", group=grp_filters)
+
+grp_stops = "Stop Loss Management"
+atrLength      = input.int(14, title="ATR Length", group=grp_stops)
+atrStopPadding = input.float(0.5, title="ATR Stop Padding (Multiplier)", step=0.1, group=grp_stops)
+
+grp_risk = "Risk Management (MAR Filter)"
+maxRiskPoints = input.float(20.0, title="Max Stop Loss Distance (Points)", group=grp_risk, tooltip="If Entry to Stop distance exceeds this, trade is aborted.")
+showRejected  = input.bool(true, title="Show Rejected Setups on Chart", group=grp_risk)
+
+grp_box   = "Visuals"
+blkBoxCol = input.color(color.new(color.gray, 70), title="Black Box Color", group=grp_box)
+showLines = input.bool(true, title="Show Tracked Levels", group=grp_box)
+
+// =========================================================================
+// 2. DATA & CALCULATIONS
+// =========================================================================
+ema = ta.ema(close, emaLength)
+atr = ta.atr(atrLength)
+
+plot(useEmaFilter ? ema : na, color=color.blue, title="Macro Trend EMA")
+
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low, leftBars, rightBars)
+
+longTrendOk  = useEmaFilter ? (close > ema) : true
+shortTrendOk = useEmaFilter ? (close < ema) : true
+
+// =========================================================================
+// 3. STATE MACHINE: RESISTANCE (LONG BLACK BOX)
+// =========================================================================
+var float resLevel = na
+var int   resState = 0   
+var int   resFakeoutIdx = na
+var float resFakeoutExtreme = na 
+var float resPullbackExtreme = na
+var int   resPullbackIdx = na
+
+if not na(ph) and resState == 0
+    resLevel := ph
+
+plot(showLines and resState == 0 ? resLevel : na, title="Tracking Res", color=color.new(color.red, 50), style=plot.style_stepline)
+
+if not na(resLevel)
+    
+    // State 1: The Bait
+    if resState == 0 and close > resLevel
+        resState := 1
+        resFakeoutIdx := bar_index
+        resFakeoutExtreme := high
+        
+    // State 2: Manage Bait & Wait for Flush
+    else if resState == 1
+        resFakeoutExtreme := math.max(resFakeoutExtreme, high) 
+        
+        if (bar_index - resFakeoutIdx) > maxFakeoutBars
+            resLevel := na
+            resState := 0 
+            
+        else if close < resLevel 
+            validBait = useAtrBait ? (resFakeoutExtreme - resLevel) > (atr * atrBaitMult) : true
+            if validBait
+                resState := 2
+                resPullbackExtreme := low
+                resPullbackIdx := bar_index
+            else
+                resLevel := na
+                resState := 0 
+            
+    // State 3: Trigger & RISK FILTER
+    else if resState == 2
+        resPullbackExtreme := math.min(resPullbackExtreme, low) 
+        
+        if (bar_index - resPullbackIdx) > maxWaitBars
+            resLevel := na
+            resState := 0 
+            
+        else if close > resLevel and longTrendOk 
+            float safeStop = resPullbackExtreme - (atr * atrStopPadding)
+            float riskDist = math.abs(close - safeStop) // Calculate exact point risk
+            
+            // EXECUTION: CHECK RISK
+            if riskDist <= maxRiskPoints
+                box.new(left=resPullbackIdx, top=resLevel, right=bar_index, bottom=resPullbackExtreme, bgcolor=blkBoxCol, border_color=color.gray)
+                label.new(x=bar_index, y=safeStop, text="BB LONG\n▲", style=label.style_label_up, color=color.black, textcolor=color.white, size=size.small)
+                alert("Black Box LONG. Ticker: " + syminfo.ticker + " Entry: " + str.tostring(close) + " Stop: " + str.tostring(safeStop), alert.freq_once_per_bar_close)
+            else
+                // REJECTED: Risk too high
+                if showRejected
+                    label.new(x=bar_index, y=safeStop, text="REJECTED\n(Risk: " + str.tostring(math.round(riskDist, 1)) + ")", style=label.style_label_up, color=color.gray, textcolor=color.white, size=size.small)
+            
+            resLevel := na
+            resState := 0
+
+// =========================================================================
+// 4. STATE MACHINE: SUPPORT (SHORT BLACK BOX)
+// =========================================================================
+var float supLevel = na
+var int   supState = 0   
+var int   supFakeoutIdx = na
+var float supFakeoutExtreme = na 
+var float supPullbackExtreme = na
+var int   supPullbackIdx = na
+
+if not na(pl) and supState == 0
+    supLevel := pl
+
+plot(showLines and supState == 0 ? supLevel : na, title="Tracking Sup", color=color.new(color.green, 50), style=plot.style_stepline)
+
+if not na(supLevel)
+    
+    // State 1: The Bait
+    if supState == 0 and close < supLevel
+        supState := 1
+        supFakeoutIdx := bar_index
+        supFakeoutExtreme := low
+        
+    // State 2: Manage Bait & Wait for Flush
+    else if supState == 1
+        supFakeoutExtreme := math.min(supFakeoutExtreme, low) 
+        
+        if (bar_index - supFakeoutIdx) > maxFakeoutBars
+            supLevel := na
+            supState := 0 
+            
+        else if close > supLevel 
+            validBait = useAtrBait ? (supLevel - supFakeoutExtreme) > (atr * atrBaitMult) : true
+            if validBait
+                supState := 2
+                supPullbackExtreme := high
+                supPullbackIdx := bar_index
+            else
+                supLevel := na
+                supState := 0 
+            
+    // State 3: Trigger & RISK FILTER
+    else if supState == 2
+        supPullbackExtreme := math.max(supPullbackExtreme, high) 
+        
+        if (bar_index - supPullbackIdx) > maxWaitBars
+            supLevel := na
+            supState := 0 
+            
+        else if close < supLevel and shortTrendOk 
+            float safeStop = supPullbackExtreme + (atr * atrStopPadding)
+            float riskDist = math.abs(safeStop - close) // Calculate exact point risk
+            
+            // EXECUTION: CHECK RISK
+            if riskDist <= maxRiskPoints
+                box.new(left=supPullbackIdx, top=supPullbackExtreme, right=bar_index, bottom=supLevel, bgcolor=blkBoxCol, border_color=color.gray)
+                label.new(x=bar_index, y=safeStop, text="BB SHORT\n▼", style=label.style_label_down, color=color.black, textcolor=color.white, size=size.small)
+                alert("Black Box SHORT. Ticker: " + syminfo.ticker + " Entry: " + str.tostring(close) + " Stop: " + str.tostring(safeStop), alert.freq_once_per_bar_close)
+            else
+                // REJECTED: Risk too high
+                if showRejected
+                    label.new(x=bar_index, y=safeStop, text="REJECTED\n(Risk: " + str.tostring(math.round(riskDist, 1)) + ")", style=label.style_label_down, color=color.gray, textcolor=color.white, size=size.small)
+            
+            supLevel := na
+            supState := 0
